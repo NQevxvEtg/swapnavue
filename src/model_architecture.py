@@ -1,14 +1,13 @@
 # src/model_architecture.py
 import torch
-from torch import compile
 import torch.nn as nn
 import torch.nn.functional as F
+from sentence_transformers import SentenceTransformer
 import logging
 import random
 import asyncio 
-import numpy as np 
 
-from typing import TYPE_CHECKING, Optional, List
+from typing import TYPE_CHECKING, Optional
 from src.websocket_manager import broadcast_memory_state
 
 if TYPE_CHECKING:
@@ -16,7 +15,7 @@ if TYPE_CHECKING:
 
 from src.model_parts import CombineContext, DenoiseNet, ProjectHead, UpdateFastState
 from src.text_decoder import TextDecoder
-from src.utils import initialize_weights, decode_sequence, Vocabulary 
+from src.utils import initialize_weights, decode_sequence
 from src.emotion import EmotionalCore
 from src.heart import Heart
 from src.self_reflection import SelfReflectionModule
@@ -25,7 +24,6 @@ from src.encoders import SensorimotorEncoder
 from src.spatial_pooler import SpatialPooler
 from src.temporal_memory import TemporalMemory
 from src.consolidation import ConsolidationManager
-from src.text_sdr_encoder import TextSdrEncoder 
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -38,30 +36,28 @@ class ContinuouslyReasoningPredictor(nn.Module):
     governed by a rhythmic EmotionalCore and regulated by a homeostatic Heart.
     """
     def __init__(self, 
+                 embedding_model: Optional[SentenceTransformer] = None, 
+                 embedding_model_name: Optional[str] = None, 
                  text_decoder_config: dict = None, 
                  spatial_pooler_config: dict = None, 
                  temporal_memory_config: dict = None, 
-                 sdr_size: int = 2048, 
-                 sdr_active_bits: int = 40, 
-                 device: torch.device = None,
-                 vocab: Optional[Vocabulary] = None 
-                 ):
+                 device: torch.device = None):
         super().__init__()
         self.device = device
         
-        # --- Text Encoding with Custom RDSE ---
-        if vocab is None:
-            raise ValueError("Vocabulary instance must be provided to ContinuouslyReasoningPredictor.")
-        self.vocab = vocab
-        self.sdr_size = sdr_size
-        self.sdr_active_bits = sdr_active_bits
-        self.text_sdr_encoder = TextSdrEncoder(
-            vocab=self.vocab, 
-            sdr_size=self.sdr_size, 
-            sdr_active_bits=self.sdr_active_bits
-        )
-        self.embedding_dim = self.sdr_size 
-        logger.info(f"Model embedding dimension (SDR size): {self.embedding_dim}")
+        # --- Embedding Model Handling ---
+        if embedding_model is not None:
+            self.embedding_model = embedding_model
+            logger.info("Using pre-loaded sentence transformer model.")
+        elif embedding_model_name is not None:
+            logger.info(f"Loading sentence transformer model: {embedding_model_name}...")
+            self.embedding_model = SentenceTransformer(embedding_model_name, device=self.device)
+            logger.info(f"Embedding model loaded.")
+        else:
+            raise ValueError("Either 'embedding_model' or 'embedding_model_name' must be provided to ContinuouslyReasoningPredictor.")
+            
+        self.embedding_dim = self.embedding_model.get_sentence_embedding_dimension()
+        logger.info(f"Embedding model dimension: {self.embedding_dim}")
 
         # --- Core Cognitive Components ---
         self.emotions = EmotionalCore().to(device)
@@ -69,20 +65,22 @@ class ContinuouslyReasoningPredictor(nn.Module):
         self.model_dims = self.emotions.model_dims.int().item()
         self.knowledge_dims = self.emotions.knowledge_dims.int().item()
         
+        # If embedding dim doesn't match model's internal working dim, project it.
         if self.embedding_dim != self.model_dims:
             self.input_projection = nn.Linear(self.embedding_dim, self.model_dims).to(device)
             initialize_weights(self.input_projection)
         else:
             self.input_projection = nn.Identity().to(device)
 
-        # --- HTM Components ---
-        spatial_pooler_config['input_dims'] = self.sdr_size 
+        # --- HTM Components (Now fully configured from main.py) ---
         self.sensorimotor_encoder = SensorimotorEncoder(self.model_dims, spatial_pooler_config['input_dims']).to(device)
         self.spatial_pooler = SpatialPooler(**spatial_pooler_config).to(device)
         self.temporal_memory = TemporalMemory(**temporal_memory_config, device=device).to(device)
         
         # --- Language and Reasoning Components ---
-        text_decoder_config['embedding_dim'] = self.embedding_dim
+        # Ensure text_decoder_config uses the actual embedding_dim
+        if 'embedding_dim' in text_decoder_config:
+            text_decoder_config['embedding_dim'] = self.embedding_dim
         self.text_decoder = TextDecoder(**text_decoder_config).to(device)
         self.project_head = ProjectHead(self.model_dims, self.embedding_dim).to(device)
         self.combine_context = CombineContext(self.model_dims, self.model_dims, self.knowledge_dims, self.model_dims).to(device)
@@ -138,14 +136,14 @@ class ContinuouslyReasoningPredictor(nn.Module):
         return z_0, c_t
 
 
-    async def _get_predicted_embedding(self, input_embedding_sdr: torch.Tensor, stop_event: asyncio.Event = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    async def _get_predicted_embedding(self, input_embedding: torch.Tensor, stop_event: asyncio.Event = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         self.emotions.update()
         
-        processed_input_embedding = self.input_projection(input_embedding_sdr)
+        processed_input_embedding = self.input_projection(input_embedding)
 
         # HTM Integration Start
         encoded_input = self.sensorimotor_encoder(processed_input_embedding)
-        sdr_batch = self.spatial_pooler(encoded_input) # sdr_batch is [batch_size, num_columns_in_sdr]
+        sdr_batch = self.spatial_pooler(encoded_input)
         
         # Derive modulation signal (e.g., from curiosity)
         modulation_signal = self.emotions.get_curiosity()
@@ -156,14 +154,12 @@ class ContinuouslyReasoningPredictor(nn.Module):
         batch_accuracies_tm = []
         batch_sparsities_tm = []
         
-        # Initialize placeholders for the outputs from the last sample in the batch
-        # These will be used for visualization, so they need to be single samples.
-        final_active_cells = None 
-        final_predictive_cells_for_next_step = None 
+        final_active_cells = None # Will store the active cells after the last SDR in the batch
+        final_predictive_cells_for_next_step = None # Will store the predictive cells after the last SDR
 
         # Process SDRs sequentially through the stateful Temporal Memory
-        # Each sdr_output is one sample from the batch, shape: [num_columns_in_sdr]
         for sdr_output in sdr_batch:
+            # self.temporal_memory.forward now returns (active_cells, predictive_cells_for_next_step, current_batch_accuracy)
             active_cells_current_step, predictive_cells_for_next_step, current_tm_accuracy_for_sdr = self.temporal_memory(sdr_output, modulation_signal)
             
             # Update the latest internal TM states (from the last SDR in the batch)
@@ -174,7 +170,6 @@ class ContinuouslyReasoningPredictor(nn.Module):
             batch_accuracies_tm.append(current_tm_accuracy_for_sdr)
             
             total_active_cells_current_step = active_cells_current_step.float().sum()
-            # Ensure proper calculation if no cells are active
             batch_sparsities_tm.append((total_active_cells_current_step / active_cells_current_step.numel()).item() if active_cells_current_step.numel() > 0 else 0.0)
 
         # After the loop, average the metrics for the entire batch and store them.
@@ -182,13 +177,8 @@ class ContinuouslyReasoningPredictor(nn.Module):
         self.latest_tm_sparsity = torch.tensor(batch_sparsities_tm).mean().item() if batch_sparsities_tm else 0.0
         # --- END: Corrected TM Metric Calculation and TM processing ---
 
-        # Ensure final_active_cells is not None (e.g., if sdr_batch was empty)
-        if final_active_cells is None:
-            # Fallback to a zero tensor if no SDRs were processed
-            htm_output_dense = torch.zeros(self.temporal_memory.num_cells, device=self.device)
-        else:
-            # Convert sparse active_cells (boolean tensor) to a dense float tensor for projection
-            htm_output_dense = final_active_cells.float()
+        # Convert sparse active_cells (boolean tensor) to a dense float tensor for projection
+        htm_output_dense = final_active_cells.float()
         
         # Project HTM output to embedding_dim
         htm_predicted_embedding = self.htm_to_embedding_projection(htm_output_dense)
@@ -208,15 +198,6 @@ class ContinuouslyReasoningPredictor(nn.Module):
         self.latest_meta_error = current_meta_error
         
         with torch.no_grad():
-            # For cosine similarity, ensure both tensors have a batch dimension if needed
-            # Here, slow_state is (1, knowledge_dims) and fast_state.mean is (1, model_dims)
-            # They need to be compatible or projected to the same space for a meaningful similarity.
-            # Assuming model_dims and knowledge_dims are intended to be comparable,
-            # or perhaps this similarity is just for reporting state drift.
-            # If fast_state and slow_state are different dimensions, direct cosine similarity might fail.
-            # Assuming for now they can be compared after appropriate expansion/reduction.
-            # If model_dims != knowledge_dims, this might need a projection.
-            # For current context, assuming `fast_state.mean(dim=0, keepdim=True)` makes it compatible.
             similarity = F.cosine_similarity(self.slow_state, self.fast_state.mean(dim=0, keepdim=True))
             self.latest_state_drift = (1.0 - similarity.mean()).item()
 
@@ -230,53 +211,32 @@ class ContinuouslyReasoningPredictor(nn.Module):
                 expanded_fast_state,
                 processed_input_embedding,
                 reasoned_state_z0
-            ).mean(dim=0, keepdim=True) # Averaging over batch if batch_size > 1
+            ).mean(dim=0, keepdim=True)
             self.fast_state.copy_(new_fast_state)
 
         # Return the final active cells state for potential visualization, and the sdr_batch
         return predicted_embedding, sdr_batch, final_active_cells, self.latest_tm_predictive_accuracy
 
-    async def learn_one_step(self, text_t_batch: List[str], target_sequence_t_plus_1_batch: torch.Tensor, websocket_manager: "ConnectionManager" = None, stop_event: asyncio.Event = None):
+    async def learn_one_step(self, x_t: torch.Tensor, target_sequence_t_plus_1: torch.Tensor, websocket_manager: "ConnectionManager" = None, stop_event: asyncio.Event = None):
             if stop_event and stop_event.is_set():
                 raise asyncio.CancelledError("Training stopped by user.")
 
-            # Encode the batch of text strings into sequences of SDRs
-            # This returns List[List[np.ndarray]]
-            batch_sdr_sequences = self.text_sdr_encoder.encode_batch(text_t_batch)
-            
-            # Convert list of numpy SDR sequences to a single torch.Tensor
-            # Shape: [batch_size, sdr_size]
-            input_embedding_sdr_batch = []
-            for sdr_sequence in batch_sdr_sequences:
-                if not sdr_sequence:
-                    # Handle empty text case for an individual sample in the batch
-                    input_embedding_sdr_batch.append(torch.zeros(self.sdr_size, dtype=torch.float32, device=self.device))
-                    logger.warning("Empty text input received in learn_one_step batch. Using zero SDR for a sample.")
-                else:
-                    # Average the SDRs in the sequence to get a single embedding per text
-                    input_embedding_sdr_batch.append(
-                        torch.tensor(np.array(sdr_sequence), dtype=torch.float32, device=self.device).mean(dim=0)
-                    )
-            
-            # Stack all individual embeddings into a batch tensor
-            input_embedding_sdr_batch = torch.stack(input_embedding_sdr_batch, dim=0)
-
-
-            predicted_embedding, spatial_pooler_output, active_cells, tm_accuracy_metric = await self._get_predicted_embedding(input_embedding_sdr_batch, stop_event)
+            # _get_predicted_embedding now returns HTM outputs including the accuracy metric
+            predicted_embedding, spatial_pooler_output, active_cells, tm_accuracy_metric = await self._get_predicted_embedding(x_t, stop_event)
             self.latest_tm_predictive_accuracy = tm_accuracy_metric # Store it for later access
 
-            # target_sequence_t_plus_1_batch is already [batch_size, max_len]
-            max_len = target_sequence_t_plus_1_batch.shape[1]
-            decoded_logits = self.text_decoder.forward_teacher_forced(predicted_embedding, max_len, target_sequence_t_plus_1_batch)
+            max_len = target_sequence_t_plus_1.shape[1]
+            decoded_logits = self.text_decoder.forward_teacher_forced(predicted_embedding, max_len, target_sequence_t_plus_1)
 
             loss_criterion = nn.CrossEntropyLoss(ignore_index=self.pad_token_id)
             loss_value = loss_criterion(
                 decoded_logits.reshape(-1, self.text_decoder.vocab_size),
-                target_sequence_t_plus_1_batch.reshape(-1)
+                target_sequence_t_plus_1.reshape(-1)
             )
 
-            # Consolidation Trigger Logic (remains largely the same, operates on latest states)
+            # Consolidation Trigger Logic
             if self.latest_confidence is not None and self.latest_meta_error is not None:
+                # Example thresholding: high confidence AND low meta-error
                 confidence_threshold = 0.8
                 meta_error_threshold = 0.1
                 
@@ -285,50 +245,52 @@ class ContinuouslyReasoningPredictor(nn.Module):
                     
                     logger.debug(f"Adding to consolidation queue: Confidence={self.latest_confidence.mean().item():.4f}, MetaError={self.latest_meta_error.mean().item():.4f}")
                     
-                    # Add current HTM states to consolidation queue
-                    # spatial_pooler_output is now a batch of SDRs.
-                    # We might want to pass the entire batch for consolidation, or a subset.
-                    # For simplicity, if consolidation processes one trace at a time,
-                    # we might need to decide which trace from the batch to consolidate.
-                    # For now, will pass the entire batch as a list of individual SDRs from the batch
-                    # This will assume consolidation_manager can process a list of SDRs (from the batch dimension)
-                    self.consolidation_manager.add_to_consolidation_queue(
-                        memory_trace=[sdr for sdr in spatial_pooler_output] # Pass individual SDRs from batch
-                    )
+                    for sdr_item in spatial_pooler_output:
+                        self.consolidation_manager.add_to_consolidation_queue(
+                            memory_trace=[sdr_item]
+                        )
                     
+                    # Periodically trigger actual consolidation from the queue
                     self.consolidation_counter += 1
                     if self.consolidation_counter % self.consolidation_interval == 0:
                         logger.info("Initiating consolidation of memories from queue.")
                         pass 
-                        self.consolidation_counter = 0 
+                        self.consolidation_counter = 0 # Reset counter after triggering
             
-            # Memory visualization (uses the last item from the batch for display)
+            # ---- START: FIX for memory visualization ----
             if websocket_manager and websocket_manager.active_connections:
-                predictive_cells = self.temporal_memory.predictive_cells 
+                # 1. Gather all required raw data from the temporal memory
+                predictive_cells = self.temporal_memory.predictive_cells # This is the prediction for the *next* step
                 volatile_perms = self.temporal_memory.volatile_permanences
                 consolidated_perms = self.temporal_memory.consolidated_permanences
 
-                # Select the LAST item from the batch for visualization
-                sdr_for_viz = spatial_pooler_output[-1] 
+                # 2. Process for serialization
+                # Select the LAST item from the batch for visualization, as it corresponds
+                # to the final state of the stateful TM module.
+                sdr_for_viz = spatial_pooler_output[-1]
                 sdr_list = sdr_for_viz.flatten().int().tolist()
                 
+                # These states from the TM correspond to the last processed item.
                 active_cells_list = active_cells.flatten().int().tolist()
                 predictive_cells_list = predictive_cells.flatten().int().tolist()
 
+                # Create histograms for permanence distributions
                 volatile_hist = torch.histogram(volatile_perms.flatten().cpu(), bins=32, range=(0.0, 1.0))
                 consolidated_hist = torch.histogram(consolidated_perms.flatten().cpu(), bins=32, range=(0.0, 1.0))
                 
                 permanence_data = {
                     'volatile': {
-                        'values': volatile_hist[0].tolist(), 
+                        'values': volatile_hist[0].tolist(), # Send raw counts for volatile
                         'bins': volatile_hist[1].tolist()
                     },
                     'consolidated': {
-                        'values': consolidated_hist[0].tolist(), 
+                        'values': consolidated_hist[0].tolist(), # Send raw counts for consolidated
                         'bins': consolidated_hist[1].tolist()
                     }
                 }
 
+                # 3. Assemble payload with corrected data and grid dimensions
+                # Calculate a more square-like grid for the SDR visualization
                 sdr_total_bits = sdr_for_viz.numel()
                 grid_cols_sdr = int(sdr_total_bits**0.5)
                 grid_rows_sdr = (sdr_total_bits + grid_cols_sdr - 1) // grid_cols_sdr
@@ -336,43 +298,29 @@ class ContinuouslyReasoningPredictor(nn.Module):
                 memory_state_payload = {
                     "sdr": sdr_list,
                     "activeCells": active_cells_list,
-                    "predictiveCells": predictive_cells_list, 
+                    "predictiveCells": predictive_cells_list, # Add missing predictive cells
                     "permanences": permanence_data,
                     "gridDimensions": {
-                        "sdr": [grid_rows_sdr, grid_cols_sdr], 
+                        "sdr": [grid_rows_sdr, grid_cols_sdr], # Use new dimensions
                         "cells": [self.temporal_memory.columns, self.temporal_memory.cells_per_column]
                     }
                 }
+                
+                # 4. Broadcast the corrected payload
                 await broadcast_memory_state(websocket_manager, memory_state_payload)
+            # ---- END: FIX for memory visualization ----
                 
             return loss_value
 
-    async def generate_text(self, input_texts: List[str], max_len: int = None, top_p: float = 0.9) -> List[List[int]]:
-        """
-        Generates text for a batch of input texts.
-        input_texts is now a List[str].
-        Returns List[List[int]] (list of token ID sequences).
-        """
+    async def generate_text(self, input_embedding: torch.Tensor, max_len: int = None, top_p: float = 0.9) -> list[int]:
         if max_len is None:
             max_len = self.emotions.max_seq_len.int().item()
 
         self.eval()
         with torch.no_grad():
-            # Encode the batch of text strings into SDRs
-            batch_sdr_sequences_encoded = self.text_sdr_encoder.encode_batch(input_texts)
-            
-            # Convert list of numpy SDR sequences to a single torch.Tensor [batch_size, sdr_size]
-            input_embedding_sdr_batch = []
-            for sdr_sequence in batch_sdr_sequences_encoded:
-                if not sdr_sequence:
-                    input_embedding_sdr_batch.append(torch.zeros(self.sdr_size, dtype=torch.float32, device=self.device))
-                else:
-                    input_embedding_sdr_batch.append(
-                        torch.tensor(np.array(sdr_sequence), dtype=torch.float32, device=self.device).mean(dim=0)
-                    )
-            input_embedding_sdr_batch = torch.stack(input_embedding_sdr_batch, dim=0)
-
-            predicted_embedding, _, _, _ = await self._get_predicted_embedding(input_embedding_sdr_batch)
+            # When generating text, we don't need the HTM outputs for consolidation,
+            # so we can just unpack the first returned value.
+            predicted_embedding, _, _, _ = await self._get_predicted_embedding(input_embedding)
             
             batch_size = predicted_embedding.shape[0]
             hidden = self.text_decoder.get_initial_hidden(predicted_embedding)
@@ -399,8 +347,6 @@ class ContinuouslyReasoningPredictor(nn.Module):
                 generated_sequences[:, t] = next_token
                 input_token = next_token
 
-                # Stop generation for sequences that have reached EOS
-                # Use a boolean mask to track which sequences are done
                 if (next_token == self.eos_token_id).all():
                     break
         
@@ -421,9 +367,10 @@ class ContinuouslyReasoningPredictor(nn.Module):
                 }
                 self_reflection_prompt = self.self_prompting_module.generate_prompt(current_states)
 
-            # Now, generate_text expects a list of strings
-            generated_ids_list_batch = await self.generate_text([self_reflection_prompt], max_len=max_len)
-            thought_text = decode_sequence(generated_ids_list_batch[0], vocab, self.eos_token_id) # Take the first (and only) sequence
+            prompt_embedding = self.embedding_model.encode([self_reflection_prompt], convert_to_tensor=True, device=self.device)
+            
+            generated_ids_list = await self.generate_text(prompt_embedding, max_len=max_len)
+            thought_text = decode_sequence(generated_ids_list[0], vocab, self.eos_token_id)
 
             confidence = self.latest_confidence.mean().item() if self.latest_confidence is not None else 0.0
             meta_error = self.latest_meta_error.mean().item() if self.latest_meta_error is not None else 0.0

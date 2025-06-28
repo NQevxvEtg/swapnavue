@@ -2,7 +2,7 @@
 import asyncio
 import logging
 from fastapi import WebSocket, WebSocketDisconnect
-from typing import List, Any, Dict
+from typing import List, Any, Dict, Optional
 import json
 # Database Imports
 from sqlalchemy.orm import Session

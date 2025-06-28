@@ -59,10 +59,9 @@ def load_texts_from_specific_files(filepaths: list[str]) -> list[str]:
     for file_path in filepaths:
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
-                # Filter out empty or whitespace-only lines and strip leading/trailing whitespace
-                lines = [line.strip() for line in f if line.strip()] 
+                lines = f.readlines()
                 all_texts.extend(lines)
-            logger.info(f"Loading {len(lines)} non-empty lines from changed file: {os.path.basename(file_path)}")
+            logger.info(f"Loading {len(lines)} lines from changed file: {os.path.basename(file_path)}")
         except Exception as e:
             logger.error(f"Error loading {file_path}: {e}")
     return all_texts
@@ -102,13 +101,13 @@ class TextDataset(Dataset):
 
     def __getitem__(self, idx: int):
         """
-        Retrieves a single text sample and processes it into raw input text
-        and a tokenized target sequence.
+        Retrieves a single text sample and processes it into input text
+        for embedding and a tokenized target sequence.
         """
         text = self.texts[idx]
 
-        # The raw text is passed as input for the model's internal encoding
-        input_text = text
+        # The original text is passed for sentence embedding by the model itself
+        input_embedding_text = text
 
         # Tokenize the text using our custom vocabulary's encode method
         tokens = self.vocab.encode(text)
@@ -129,14 +128,14 @@ class TextDataset(Dataset):
             target_sequence = processed_tokens
 
         return {
-            'input_text': input_text, # Raw text for model's internal SDR encoding
+            'input_text': input_embedding_text, # Original text for sentence embedding
             'target_sequence': torch.tensor(target_sequence, dtype=torch.long)
         }
 
 def collate_fn(batch: list[dict]) -> tuple[list[str], torch.Tensor]:
     """
     Collation function for DataLoader.
-    Stacks target sequences and collects raw input texts for batch processing.
+    Stacks target sequences and collects input texts for batch processing.
     """
     input_texts = [item['input_text'] for item in batch]
     target_sequences = torch.stack([item['target_sequence'] for item in batch])
