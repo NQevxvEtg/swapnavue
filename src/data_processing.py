@@ -90,11 +90,10 @@ class TextDataset(Dataset):
     A PyTorch Dataset for handling text data, performing tokenization,
     and preparing target sequences for the CRP model.
     """
-    def __init__(self, texts: list[str], vocab: Vocabulary, max_seq_len: int, embedding_max_seq_len: int):
+    def __init__(self, texts: list[str], vocab: Vocabulary, max_seq_len: int):
         self.texts = texts
         self.vocab = vocab
         self.max_seq_len = max_seq_len
-        self.embedding_max_seq_len = embedding_max_seq_len # Max sequence length for the embedding model
 
     def __len__(self):
         """Returns the total number of text samples."""
@@ -107,16 +106,8 @@ class TextDataset(Dataset):
         """
         text = self.texts[idx]
 
-        # Truncate input text for embedding model to prevent sequence length errors
-        # This truncates the raw text, which will then be tokenized by the embedding model.
-        # It's a heuristic based on the typical character-to-token ratio.
-        # A more precise way would be to tokenize here and truncate based on token IDs,
-        # but that would require exposing the embedding model's tokenizer here.
-        # For now, we'll use a character-based heuristic or directly use the model's max_seq_length.
-        # The error indicates 512 is the token limit, so truncating the raw text to that length
-        # is the most direct way to ensure it doesn't exceed the model's internal limit after tokenization.
-        input_embedding_text = text[:self.embedding_max_seq_len]
-
+        # The original text is passed for sentence embedding by the model itself
+        input_embedding_text = text
 
         # Tokenize the text using our custom vocabulary's encode method
         tokens = self.vocab.encode(text)

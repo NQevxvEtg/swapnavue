@@ -146,18 +146,21 @@ async def validate_model_step(
 
     with torch.no_grad():
         for batch_idx, (input_texts, target_sequences) in enumerate(val_dataloader):
-            # Ensure input_embeddings and target_sequences are always defined for the current batch
-            input_embeddings = model.embedding_model.encode(
-                input_texts,
-                convert_to_tensor=True,
-                device=device,
-                show_progress_bar=False # Optional: disable if not needed
-            )
-            target_sequences = target_sequences.to(device)
-
             if max_batches is not None and batch_idx >= max_batches:
-                break # Now, break occurs *after* variables are defined for the current batch_idx
+                break
 
+                # Directly encode the batch of texts using the SentenceTransformer's optimized method.
+                # The `encode_long_text` utility is still useful for *single* very long texts,
+                # but for batch processing, the model's direct `encode` is more efficient.
+                input_embeddings = model.embedding_model.encode(
+                    input_texts,
+                    convert_to_tensor=True,
+                    device=device,
+                    show_progress_bar=False # Optional: disable if not needed
+                )
+
+            target_sequences = target_sequences.to(device)
+            
             with autocast(device_type=device.type):
                 # FIX: Unpack the tuple returned by _get_predicted_embedding
                 predicted_embedding, _, _, _ = await model._get_predicted_embedding(input_embeddings)
@@ -215,13 +218,8 @@ async def run_model_training(
 
     train_texts = await asyncio.to_thread(load_texts_from_directory, train_data_dir)
     val_texts = await asyncio.to_thread(load_texts_from_directory, val_data_dir)
-
-    # Get the max sequence length from the embedding model
-    # SentenceTransformer models typically have this attribute
-    embedding_max_seq_len = model.embedding_model.max_seq_length
-
-    train_dataset = TextDataset(train_texts, vocab, MAX_SEQ_LEN, embedding_max_seq_len)
-    val_dataset = TextDataset(val_texts, vocab, MAX_SEQ_LEN, embedding_max_seq_len)
+    train_dataset = TextDataset(train_texts, vocab, MAX_SEQ_LEN)
+    val_dataset = TextDataset(val_texts, vocab, MAX_SEQ_LEN)
     train_dataloader = DataLoader(train_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
     val_dataloader = DataLoader(val_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
     
