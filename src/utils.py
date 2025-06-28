@@ -10,7 +10,6 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 class Vocabulary:
-    # ... (No changes to Vocabulary class) ...
     """
     Manages the vocabulary for tokenization and provides utilities for
     converting between words/subwords and their numerical IDs.
@@ -184,61 +183,10 @@ def decode_sequence(token_ids: list[int], vocab: Vocabulary, eos_token_id: int) 
     return decoded_string
 
 
-def encode_long_text(
-    text: str, 
-    model: nn.Module, 
-    tokenizer, 
-    device: torch.device, 
-    max_length: int = 512, 
-    overlap: int = 50
-) -> torch.Tensor:
-    """
-    Encodes long text by chunking it, embedding each chunk, and averaging the results.
-    This provides a single, representative embedding for text of any length.
-
-    Args:
-        text (str): The input text to encode.
-        model (nn.Module): The sentence-transformer model for encoding.
-        tokenizer: The tokenizer associated with the model.
-        device (torch.device): The device to run the model on ('cuda' or 'cpu').
-        max_length (int): The maximum sequence length of the model.
-        overlap (int): The number of tokens to overlap between chunks.
-
-    Returns:
-        torch.Tensor: A single embedding tensor for the entire text.
-    """
-    # Tokenize the entire text to get a sequence of all its tokens
-    tokens = tokenizer.tokenize(text)
-
-    # If the text is already short enough, encode it directly without chunking
-    if len(tokens) <= max_length:
-        return model.encode([text], convert_to_tensor=True, device=device)
-
-    logger.info(f"Text is too long ({len(tokens)} tokens). Applying chunking strategy.")
-    
-    # Split the tokens into overlapping chunks
-    chunk_tokens = []
-    stride = max_length - overlap  # How many tokens to advance for the next chunk
-    for i in range(0, len(tokens), stride):
-        chunk = tokens[i:i + max_length]
-        chunk_tokens.append(chunk)
-
-    # Convert the token chunks back into text strings
-    chunk_texts = [tokenizer.convert_tokens_to_string(chunk) for chunk in chunk_tokens]
-
-    # Encode all text chunks in a single, efficient batch call
-    chunk_embeddings = model.encode(chunk_texts, convert_to_tensor=True, device=device)
-
-    # Average the embeddings of all chunks to get a single representative embedding
-    mean_embedding = torch.mean(chunk_embeddings, dim=0, keepdim=True)
-    
-    logger.info(f"Successfully created a single embedding from {len(chunk_texts)} chunks.")
-    return mean_embedding
-
 def get_optimal_tm_config(
     user_config: dict,
     available_vram: int,
-    vram_budget_fraction: float = 0.1
+    vram_budget_fraction: float = 0.0618
 ) -> dict:
     """
     Adjusts Temporal Memory configuration to fit within a VRAM budget.

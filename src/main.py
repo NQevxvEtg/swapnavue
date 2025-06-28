@@ -5,11 +5,11 @@ from fastapi.responses import StreamingResponse, JSONResponse
 import logging
 import os
 import torch
+from torch import compile
 import torch.nn as nn
 from torch.amp import autocast
 from torch.cuda.amp import GradScaler
 from transformers import AutoTokenizer
-from sentence_transformers import SentenceTransformer # Import SentenceTransformer here
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 import io
@@ -19,7 +19,7 @@ import asyncio
 from datetime import datetime
 import json
 import uuid
-from fastapi.middleware.cors import CORSMiddleware # Import CORSMiddleware
+from fastapi.middleware.cors import CORSMiddleware 
 
 from .api_models import GenerateRequest, GenerateResponse, InternalThoughtResponse, TrainingStatusResponse
 from .data_processing import (
@@ -30,7 +30,7 @@ from torch.utils.data import DataLoader
 
 from .database import init_db, get_db
 from .model_architecture import ContinuouslyReasoningPredictor
-from .utils import Vocabulary, decode_sequence, encode_long_text, get_optimal_tm_config
+from .utils import Vocabulary, decode_sequence, get_optimal_tm_config 
 from .websocket_manager import ConnectionManager, broadcast_state_update
 
 from .training_manager import (
@@ -58,8 +58,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all standard methods (GET, POST, PUT, DELETE, OPTIONS, etc.)
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"], 
+    allow_headers=["*"], 
 )
 
 
@@ -98,15 +98,16 @@ async def _generate_and_store_internal_thought():
 
                 with torch.no_grad():
                     with autocast(device_type=DEVICE.type):
-                        # Capture the returned values
-                        thought_text, confidence, meta_error, focus, curiosity, prompt_text_used = \
-                            await model.generate_internal_thought(vocab, max_len=64, input_prompt_override=self_reflection_prompt)
-
-
+                        # Pass the prompt as a list, and expect a list of lists of IDs back
+                        generated_ids_list_batch = await model.generate_text([self_reflection_prompt], max_len=64)
+                        # Take the first (and only) sequence from the batch for decoding
+                        thought_text = decode_sequence(generated_ids_list_batch[0], vocab, model.eos_token_id)
+                
                 # Restore the logic to create and store the thought entry
                 thought_entry = InternalThoughtResponse(
-                    thought=thought_text, timestamp=datetime.now(), confidence=confidence,
-                    meta_error=meta_error, focus=focus, curiosity=curiosity, prompt_text=prompt_text_used
+                    thought=thought_text, timestamp=datetime.now(), confidence=model.latest_confidence.mean().item() if model.latest_confidence is not None else 0.0,
+                    meta_error=model.latest_meta_error.mean().item() if model.latest_meta_error is not None else 0.0,
+                    focus=model.emotions.get_focus(), curiosity=model.emotions.get_curiosity(), prompt_text=self_reflection_prompt
                 )
                 app.state.internal_thoughts_queue.append(thought_entry)
                 app.state.internal_thought_sequence_num += 1
@@ -132,7 +133,7 @@ def reset_optimizer(task: asyncio.Task):
         app.state.optimizer = torch.optim.Adam(model.parameters(), lr=model.emotions.get_curiosity())
         app.state.scaler = torch.amp.GradScaler('cuda')
         if torch.cuda.is_available():
-            torch.cuda.empty_cache() # Clear CUDA cache
+            torch.cuda.empty_cache() 
         logger.info("Optimizer and GradScaler have been reset.")
 
 
@@ -162,33 +163,22 @@ async def startup_event():
     app.state.vocab = vocab
     logger.info(f"Vocabulary loaded. Size: {vocab.vocab_size} tokens.")
 
-    # --- 2. Load Embedding Model Early and Determine Dimensions ---
-    logger.info("Loading sentence transformer model before VRAM auto-tuning...")
-    EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-base-en-v1.5")
+    # --- 2. Removed Embedding Model Loading ---
+    SDR_SIZE = int(os.getenv("SDR_SIZE", "2048")) 
+    SDR_ACTIVE_BITS = int(os.getenv("SDR_ACTIVE_BITS", "40")) 
+    logger.info(f"Using SDRs of size {SDR_SIZE} with {SDR_ACTIVE_BITS} active bits.")
     
-    # Load the embedding model and move it to the device
-    try:
-        embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device=DEVICE)
-        embedding_dim = embedding_model.get_sentence_embedding_dimension()
-        app.state.embedding_model = embedding_model # Store it in app.state
-        logger.info(f"Embedding model '{EMBEDDING_MODEL_NAME}' loaded. Dimension: {embedding_dim}")
-    except Exception as e:
-        logger.error(f"Failed to load embedding model '{EMBEDDING_MODEL_NAME}': {e}. Please ensure it's accessible and compatible.")
-        # Fallback or raise error, depending on desired behavior
-        raise RuntimeError(f"Critical error: Failed to load embedding model. {e}")
+    embedding_dim = SDR_SIZE 
 
-    # --- 3. Configuration and Hardware Auto-Tuning (now informed by embedding model VRAM) ---
+    # --- 3. Configuration and Hardware Auto-Tuning ---
     logger.info("Reading remaining configuration and performing hardware auto-tuning...")
 
-    # Read all other model configurations from environment variables
-    # EMBEDDING_DIM is now derived from the loaded model
     DECODER_HIDDEN_DIM = int(os.getenv("DECODER_HIDDEN_DIM", "512"))
     DECODER_NUM_LAYERS = int(os.getenv("DECODER_NUM_LAYERS", "2"))
-    # SP_INPUT_DIMS should match embedding_dim, which is now accurately from the loaded model
-    SP_INPUT_DIMS = embedding_dim 
+    SP_INPUT_DIMS = SDR_SIZE 
     SP_SPARSITY = float(os.getenv("SP_SPARSITY", "0.02"))
     SP_BOOST_STRENGTH = float(os.getenv("SP_BOOST_STRENGTH", "1.0"))
-    TM_NUM_CELLS = int(os.getenv("TM_NUM_CELLS", "131072")) # Needed for memory calculation
+    TM_NUM_CELLS = int(os.getenv("TM_NUM_CELLS", "131072")) 
     TM_CELLS_PER_COLUMN = int(os.getenv("TM_CELLS_PER_COLUMN", "32"))
     TM_MAX_SEGMENTS = int(os.getenv("TM_MAX_SEGMENTS_PER_CELL", "90"))
     TM_MAX_SYNAPSES = int(os.getenv("TM_MAX_SYNAPSES_PER_SEGMENT", "90"))
@@ -196,28 +186,24 @@ async def startup_event():
     adjusted_free_mem = 0
     if torch.cuda.is_available():
         free_mem, total_mem = torch.cuda.mem_get_info()
-        logger.info(f"GPU detected. Total VRAM: {total_mem / 1024**3:.2f} GB, Available after embedding model: {free_mem / 1024**3:.2f} GB")
+        logger.info(f"GPU detected. Total VRAM: {total_mem / 1024**3:.2f} GB, Available before model: {free_mem / 1024**3:.2f} GB")
         adjusted_free_mem = free_mem
         
-        # Create a temporary config dict just for the tuner function
         config_for_tuner = {
             'num_cells': TM_NUM_CELLS,
             'max_segments_per_cell': TM_MAX_SEGMENTS,
             'max_synapses_per_segment': TM_MAX_SYNAPSES,
         }
         
-        # Run the tuner to get potentially downscaled values using adjusted free_mem
         tuned_params = get_optimal_tm_config(config_for_tuner, adjusted_free_mem)
         
-        # Update our main variables with the safe, tuned values
         TM_MAX_SEGMENTS = tuned_params['max_segments_per_cell']
         TM_MAX_SYNAPSES = tuned_params['max_synapses_per_segment']
     else:
         logger.warning("No CUDA-enabled GPU detected. Model will run on CPU.")
 
-    # Build the FINAL configuration dictionaries for the model constructors
     text_decoder_config = {
-        'embedding_dim': embedding_dim, # Use the actual embedding_dim
+        'embedding_dim': embedding_dim, 
         'hidden_size': DECODER_HIDDEN_DIM,
         'vocab_size': vocab.vocab_size,
         'sos_token_id': vocab.sos_token_id
@@ -229,40 +215,44 @@ async def startup_event():
     }
     temporal_memory_config = {
         'input_dims': SP_INPUT_DIMS,
-        'columns': SP_INPUT_DIMS,    # The TM's columns match the SP's output columns
+        'columns': SP_INPUT_DIMS,    
         'cells_per_column': TM_CELLS_PER_COLUMN,
         'distal_segments_per_cell': TM_MAX_SEGMENTS,
         'synapses_per_segment': TM_MAX_SYNAPSES,
         'permanence_threshold': 0.5,
-        'connected_permanence': 0.8, # <-- CRITICAL FIX: Changed from 0.5 to 0.8
+        'connected_permanence': 0.8, 
         'volatile_learning_rate': 0.1,
         'consolidated_learning_rate': 0.01,
         'activation_threshold': 13
     }
 
-
     # --- 4. Model Initialization ---
-    logger.info("Initializing model with hardware-aware configuration...")
+    logger.info("Initializing model with hardware-aware configuration and custom SDR encoder...")
     model = ContinuouslyReasoningPredictor(
-        embedding_model=app.state.embedding_model, # Pass the pre-loaded model directly
-        embedding_model_name=EMBEDDING_MODEL_NAME, # Pass the name as a fallback
+        vocab=app.state.vocab, 
+        sdr_size=SDR_SIZE, 
+        sdr_active_bits=SDR_ACTIVE_BITS, 
         text_decoder_config=text_decoder_config,
         spatial_pooler_config=spatial_pooler_config,
         temporal_memory_config=temporal_memory_config,
         device=DEVICE
     ).to(DEVICE)
-    # No need to re-assign model.embedding_model or model.embedding_dim here
-    # as it's handled by the CRP's __init__
+
+    # Apply torch.compile here
+    if torch.cuda.is_available(): # Only compile if CUDA is available, or remove this check if you want CPU compilation too
+        model = compile(model) # This is the key line
+        logger.info("Model compiled with torch.compile for performance optimization.")
+    else:
+        logger.info("Skipping torch.compile as CUDA is not available.")
+
     app.state.model = model
 
     # --- 5. Optimizer and State Loading ---
-    # Using a stable learning rate initially. This can be dynamically adjusted later.
     app.state.optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
     if os.path.exists(MODEL_CHECKPOINT_PATH):
         try:
             checkpoint = torch.load(MODEL_CHECKPOINT_PATH, map_location=DEVICE)
-            # Use strict=False to flexibly load weights, ignoring modules that might not match perfectly.
             app.state.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
             
             if 'optimizer_state_dict' in checkpoint:
@@ -296,19 +286,18 @@ async def generate_response(request: GenerateRequest, db: Session = Depends(get_
     continuous_learning_loss_value = 0.0
 
     try:
-        input_embedding = encode_long_text(request.prompt, model.embedding_model, vocab.tokenizer, DEVICE)
-        
         async with app.state.model_lock:
             model.train()
             max_seq_len = int(model.emotions.max_seq_len.item())
             user_tokens = vocab.encode(request.prompt)
             target_ids = [vocab.sos_token_id] + user_tokens[:max_seq_len - 2] + [vocab.eos_token_id]
             target_ids += [vocab.pad_token_id] * (max_seq_len - len(target_ids))
-            target_tensor = torch.tensor([target_ids], dtype=torch.long, device=DEVICE)
-            
+            target_tensor = torch.tensor([target_ids], dtype=torch.long, device=DEVICE) # Still a batch of 1
+
             optimizer.zero_grad(set_to_none=True)
             with autocast(device_type=DEVICE.type):
-                loss = await model.learn_one_step(input_embedding, target_tensor, websocket_manager=websocket_manager)
+                # Pass a list containing the single prompt string
+                loss = await model.learn_one_step([request.prompt], target_tensor, websocket_manager=websocket_manager)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
@@ -318,9 +307,11 @@ async def generate_response(request: GenerateRequest, db: Session = Depends(get_
             model.eval()
             with torch.no_grad():
                 with autocast(device_type=DEVICE.type):
-                    predicted_token_ids_list = await model.generate_text(input_embedding, max_len=request.max_length)
+                    # Pass a list containing the single prompt string for generation
+                    predicted_token_ids_list_batch = await model.generate_text([request.prompt], max_len=request.max_length)
             
-            response_text = decode_sequence(predicted_token_ids_list[0], vocab, vocab.eos_token_id)
+            # Decode the first (and only) sequence from the batch
+            response_text = decode_sequence(predicted_token_ids_list_batch[0], vocab, vocab.eos_token_id)
 
             await broadcast_state_update(
                 manager=websocket_manager,
@@ -379,6 +370,10 @@ async def start_training():
         raise HTTPException(status_code=400, detail="Training is already active.")
 
     try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            logger.info("CUDA cache emptied before starting new training session.")
+
         task = asyncio.create_task(run_model_training(
             model=app.state.model,
             vocab=app.state.vocab,

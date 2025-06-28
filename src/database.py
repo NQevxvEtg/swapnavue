@@ -40,7 +40,7 @@ async def init_db():
                 CREATE TABLE IF NOT EXISTS swapnavue_memories (
                     id SERIAL PRIMARY KEY,
                     text TEXT NOT NULL,
-                    embedding VECTOR(768) NOT NULL
+                    embedding VECTOR(1024) NOT NULL
                 );
             """))
             session.commit()
