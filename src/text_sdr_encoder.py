@@ -36,6 +36,13 @@ class TextSdrEncoder:
         print(f"Initialized TextSdrEncoder with SDR size: {sdr_size}, active bits: {sdr_active_bits}")
         print(f"RDSE Resolution (vocab size): {self.vocab.vocab_size}")
 
+        # --- FIX: Pre-calculate SDRs for all vocab tokens once during initialization ---
+        self.vocab_sdr_map = {}
+        for token_id in range(self.vocab.vocab_size):
+            self.vocab_sdr_map[token_id] = self.encode_single_token_id(token_id)
+        print("Pre-calculated vocab SDR map for efficient decoding.")
+
+
     def encode(self, text: str) -> List[np.ndarray]:
         """
         Encodes a text string into a sequence of SDRs.
@@ -77,17 +84,12 @@ class TextSdrEncoder:
         by calculating overlap with all possible token SDRs.
         """
         decoded_token_ids = []
-        # Pre-calculate SDRs for all vocab tokens for efficient lookup
-        # In a real scenario, this might be optimized or cached
-        vocab_sdr_map = {}
-        for token_id in range(self.vocab.vocab_size):
-            vocab_sdr_map[token_id] = self.encode_single_token_id(token_id)
-
+        # --- FIX: Use the pre-calculated vocab_sdr_map ---
         for sdr in sdr_sequence:
             max_overlap = -1
             best_token_id = self.vocab.unk_token_id # Default to unknown token
 
-            for token_id, token_sdr in vocab_sdr_map.items():
+            for token_id, token_sdr in self.vocab_sdr_map.items():
                 current_overlap = overlap(sdr, token_sdr)
                 if current_overlap > max_overlap:
                     max_overlap = current_overlap

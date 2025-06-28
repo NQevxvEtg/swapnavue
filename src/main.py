@@ -89,8 +89,8 @@ async def _generate_and_store_internal_thought():
                     self_reflection_prompt = ""
                 else:
                     current_states = {
-                        "confidence": model.latest_confidence.mean().item() if model.latest_confidence is not None else 0.0,
-                        "meta_error": model.latest_meta_error.mean().item() if model.latest_meta_error is not None else 0.0,
+                        "confidence": model.latest_confidence if model.latest_confidence is not None else 0.0, # FIXED: Removed .mean().item()
+                        "meta_error": model.latest_meta_error if model.latest_meta_error is not None else 0.0, # FIXED: Removed .mean().item()
                         "focus": model.emotions.get_focus(),
                         "curiosity": model.emotions.get_curiosity()
                     }
@@ -105,8 +105,9 @@ async def _generate_and_store_internal_thought():
                 
                 # Restore the logic to create and store the thought entry
                 thought_entry = InternalThoughtResponse(
-                    thought=thought_text, timestamp=datetime.now(), confidence=model.latest_confidence.mean().item() if model.latest_confidence is not None else 0.0,
-                    meta_error=model.latest_meta_error.mean().item() if model.latest_meta_error is not None else 0.0,
+                    thought=thought_text, timestamp=datetime.now(), 
+                    confidence=model.latest_confidence if model.latest_confidence is not None else 0.0, # FIXED: Removed .mean().item()
+                    meta_error=model.latest_meta_error if model.latest_meta_error is not None else 0.0, # FIXED: Removed .mean().item()
                     focus=model.emotions.get_focus(), curiosity=model.emotions.get_curiosity(), prompt_text=self_reflection_prompt
                 )
                 app.state.internal_thoughts_queue.append(thought_entry)
@@ -325,8 +326,8 @@ async def generate_response(request: GenerateRequest, db: Session = Depends(get_
         logger.error(f"Error in response pipeline: {e}", exc_info=True)
         response_text = f"Error: An internal exception occurred. ({e})"
     
-    confidence = model.latest_confidence.mean().item() if model.latest_confidence is not None else 0.0
-    meta_error = model.latest_meta_error.mean().item() if model.latest_meta_error is not None else 0.0
+    confidence = model.latest_confidence if model.latest_confidence is not None else 0.0, # FIXED: Removed .mean().item()
+    meta_error = model.latest_meta_error if model.latest_meta_error is not None else 0.0, # FIXED: Removed .mean().item()
     
     # Restore database logging for chat messages
     try:
@@ -426,8 +427,8 @@ async def get_training_status():
         train_loss=training_state.train_loss,
         val_loss=training_state.val_loss if training_state.val_loss != float('inf') else None,
         best_val_loss=training_state.best_val_loss if training_state.best_val_loss != float('inf') else None,
-        confidence=model.latest_confidence.mean().item() if model.latest_confidence is not None else 0.0,
-        meta_error=model.latest_meta_error.mean().item() if model.latest_meta_error is not None else 0.0,
+        confidence=model.latest_confidence if model.latest_confidence is not None else 0.0, # FIXED: Removed .mean().item()
+        meta_error=model.latest_meta_error if model.latest_meta_error is not None else 0.0, # FIXED: Removed .mean().item()
         focus=model.emotions.get_focus(),
         curiosity=model.emotions.get_curiosity(),
         message="Training active." if training_state.is_training_active else "Training not active."

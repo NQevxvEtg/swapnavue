@@ -68,8 +68,8 @@ async def broadcast_state_update(
     # --- 1. Gather All Metrics from the model and its sub-components ---
     metrics = {
         "focus": model.emotions.get_focus(),
-        "confidence": model.latest_confidence.mean().item() if model.latest_confidence is not None else 0.0,
-        "meta_error": model.latest_meta_error.mean().item() if model.latest_meta_error is not None else 0.0,
+        "confidence": model.latest_confidence if model.latest_confidence is not None else 0.0, # FIXED: Removed .mean().item()
+        "meta_error": model.latest_meta_error if model.latest_meta_error is not None else 0.0, # FIXED: Removed .mean().item()
         "curiosity": model.emotions.get_curiosity(),
         "cognitive_stress": model.latest_heart_metrics.get("cognitive_stress"),
         "target_amplitude": model.latest_heart_metrics.get("target_amplitude"),
@@ -128,4 +128,4 @@ async def broadcast_memory_state(manager: ConnectionManager, data: dict):
         "type": "memory_state",
         "data": data
     }
-    await manager.broadcast(json.dumps(payload))    
+    await manager.broadcast(json.dumps(payload))

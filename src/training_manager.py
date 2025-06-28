@@ -174,7 +174,6 @@ async def validate_model_step(
 
             total_val_loss += loss.item()
             num_processed_dataloader_batches += 1
-            await asyncio.sleep(0.001)
 
     if num_processed_dataloader_batches == 0:
         return float('inf')
@@ -256,8 +255,7 @@ async def run_model_training(
     dynamic_save_interval = SAVE_INTERVAL_BATCHES
     if num_dataloader_batches_in_epoch < SAVE_INTERVAL_BATCHES:
         dynamic_save_interval = max(1, num_dataloader_batches_in_epoch // 2)
-        if dynamic_save_interval == 0:
-            dynamic_save_interval = 1
+
         logger.info(f"Adjusting save interval to {dynamic_save_interval} due to small dataset size.")
 
     for epoch in range(TRAIN_EPOCHS):

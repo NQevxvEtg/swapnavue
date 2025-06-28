@@ -76,7 +76,8 @@ class ContinuouslyReasoningPredictor(nn.Module):
             self.input_projection = nn.Identity().to(device)
 
         # --- HTM Components ---
-        spatial_pooler_config['input_dims'] = self.sdr_size 
+        # Note: temporal_memory_config should contain 'input_dims', 'columns', 'cells_per_column' etc.
+        # This will be passed directly to TemporalMemory's __init__
         self.sensorimotor_encoder = SensorimotorEncoder(self.model_dims, spatial_pooler_config['input_dims']).to(device)
         self.spatial_pooler = SpatialPooler(**spatial_pooler_config).to(device)
         self.temporal_memory = TemporalMemory(**temporal_memory_config, device=device).to(device)
@@ -138,7 +139,7 @@ class ContinuouslyReasoningPredictor(nn.Module):
         return z_0, c_t
 
 
-    async def _get_predicted_embedding(self, input_embedding_sdr: torch.Tensor, stop_event: asyncio.Event = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    async def _get_predicted_embedding(self, input_embedding_sdr: torch.Tensor, stop_event: asyncio.Event = None) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]:
         self.emotions.update()
         
         processed_input_embedding = self.input_projection(input_embedding_sdr)
@@ -148,43 +149,39 @@ class ContinuouslyReasoningPredictor(nn.Module):
         sdr_batch = self.spatial_pooler(encoded_input) # sdr_batch is [batch_size, num_columns_in_sdr]
         
         # Derive modulation signal (e.g., from curiosity)
-        modulation_signal = self.emotions.get_curiosity()
-        if torch.is_tensor(modulation_signal):
-            modulation_signal = modulation_signal.item()
+        modulation_scalar = self.emotions.get_curiosity()
+        if torch.is_tensor(modulation_scalar):
+            modulation_scalar = modulation_scalar.item()
         
-        # --- START: Corrected TM Metric Calculation and TM processing ---
-        batch_accuracies_tm = []
-        batch_sparsities_tm = []
+        # Expand modulation_scalar to a batch_size tensor
+        batch_size = sdr_batch.shape[0]
+        modulation_signal_batch = torch.full((batch_size,), modulation_scalar, device=self.device)
+
+        # --- START: Modified TM processing for batching ---
+        # Pass the entire batch to the TemporalMemory's forward method
+        active_cells_current_step, predictive_cells_for_next_step, tm_batch_accuracy = \
+            self.temporal_memory(sdr_batch, modulation_signal_batch) # Pass full batch and batched signal
         
-        # Initialize placeholders for the outputs from the last sample in the batch
-        # These will be used for visualization, so they need to be single samples.
-        final_active_cells = None 
-        final_predictive_cells_for_next_step = None 
+        # Update TM metrics by averaging across the batch
+        self.latest_tm_predictive_accuracy = tm_batch_accuracy.mean().item() # tm_batch_accuracy is now a tensor [batch_size]
+        
+        # Calculate sparsity across the entire batch's active cells
+        # tm_output_active_cells is [batch_size, num_cells]
+        total_active_cells_batch = active_cells_current_step.float().sum(dim=-1) # Sum active cells per item [batch_size]
+        total_possible_cells = active_cells_current_step.numel() / batch_size # Total cells for a single item
+        
+        # Calculate sparsity for each item, then average
+        batch_sparsities = (total_active_cells_batch / total_possible_cells)
+        self.latest_tm_sparsity = batch_sparsities.mean().item()
+        # --- END: Modified TM processing for batching ---
 
-        # Process SDRs sequentially through the stateful Temporal Memory
-        # Each sdr_output is one sample from the batch, shape: [num_columns_in_sdr]
-        for sdr_output in sdr_batch:
-            active_cells_current_step, predictive_cells_for_next_step, current_tm_accuracy_for_sdr = self.temporal_memory(sdr_output, modulation_signal)
-            
-            # Update the latest internal TM states (from the last SDR in the batch)
-            final_active_cells = active_cells_current_step
-            final_predictive_cells_for_next_step = predictive_cells_for_next_step
-
-            # Store metrics for averaging across the batch
-            batch_accuracies_tm.append(current_tm_accuracy_for_sdr)
-            
-            total_active_cells_current_step = active_cells_current_step.float().sum()
-            # Ensure proper calculation if no cells are active
-            batch_sparsities_tm.append((total_active_cells_current_step / active_cells_current_step.numel()).item() if active_cells_current_step.numel() > 0 else 0.0)
-
-        # After the loop, average the metrics for the entire batch and store them.
-        self.latest_tm_predictive_accuracy = torch.tensor(batch_accuracies_tm).mean().item() if batch_accuracies_tm else 0.0
-        self.latest_tm_sparsity = torch.tensor(batch_sparsities_tm).mean().item() if batch_sparsities_tm else 0.0
-        # --- END: Corrected TM Metric Calculation and TM processing ---
+        # For visualization, select the LAST item from the batch for display
+        final_active_cells = active_cells_current_step[-1] # Take the last item in the batch
+        final_predictive_cells_for_next_step = predictive_cells_for_next_step[-1] # Take the last item in the batch
 
         # Ensure final_active_cells is not None (e.g., if sdr_batch was empty)
-        if final_active_cells is None:
-            # Fallback to a zero tensor if no SDRs were processed
+        if final_active_cells is None or final_active_cells.numel() == 0:
+            # Fallback to a zero tensor if no SDRs were processed or batch was empty
             htm_output_dense = torch.zeros(self.temporal_memory.num_cells, device=self.device)
         else:
             # Convert sparse active_cells (boolean tensor) to a dense float tensor for projection
@@ -196,16 +193,16 @@ class ContinuouslyReasoningPredictor(nn.Module):
 
         reasoned_state_z0, c_t_returned = await self._reason_to_predict(processed_input_embedding, stop_event)
 
-        batch_size = processed_input_embedding.shape[0]
+        # batch_size is already defined from processed_input_embedding
         expanded_fast_state_for_reflection = self.fast_state.expand(batch_size, -1)
         current_confidence, current_meta_error = self.self_reflection_module(
             reasoned_state=reasoned_state_z0,
             fast_state=expanded_fast_state_for_reflection,
-            slow_state=self.slow_state
+            slow_state=self.slow_state # slow_state is [1, knowledge_dims], self_reflection_module expands it
         )
 
-        self.latest_confidence = current_confidence
-        self.latest_meta_error = current_meta_error
+        self.latest_confidence = current_confidence.mean().item() # Mean over batch for scalar update
+        self.latest_meta_error = current_meta_error.mean().item() # Mean over batch for scalar update
         
         with torch.no_grad():
             # For cosine similarity, ensure both tensors have a batch dimension if needed
@@ -220,7 +217,11 @@ class ContinuouslyReasoningPredictor(nn.Module):
             similarity = F.cosine_similarity(self.slow_state, self.fast_state.mean(dim=0, keepdim=True))
             self.latest_state_drift = (1.0 - similarity.mean()).item()
 
-        self.latest_heart_metrics = self.heart.beat(self.emotions, self.latest_confidence, self.latest_meta_error)
+        self.latest_heart_metrics = self.heart.beat(self.emotions, current_confidence, current_meta_error) # Pass batched confidence/meta_error to heart if it handles it, or average here. Current Heart expects scalars.
+        # Adjusted: Heart.beat expects scalar confidence/meta_error, so pass the means.
+        # If Heart.beat expects full tensors for internal logic (e.g., batch-wise stress), it needs refactoring.
+        # Based on heart.py, it uses .mean().item(), so passing raw current_confidence, current_meta_error is fine if they are [batch_size] tensors.
+        # Let's check heart.py again: it calls `latest_confidence.mean().item()`. So passing `current_confidence` (tensor) is correct.
 
         predicted_embedding = self.project_head(reasoned_state_z0) + htm_predicted_embedding
 
@@ -262,7 +263,7 @@ class ContinuouslyReasoningPredictor(nn.Module):
             input_embedding_sdr_batch = torch.stack(input_embedding_sdr_batch, dim=0)
 
 
-            predicted_embedding, spatial_pooler_output, active_cells, tm_accuracy_metric = await self._get_predicted_embedding(input_embedding_sdr_batch, stop_event)
+            predicted_embedding, spatial_pooler_output, active_cells_for_viz, tm_accuracy_metric = await self._get_predicted_embedding(input_embedding_sdr_batch, stop_event)
             self.latest_tm_predictive_accuracy = tm_accuracy_metric # Store it for later access
 
             # target_sequence_t_plus_1_batch is already [batch_size, max_len]
@@ -276,44 +277,42 @@ class ContinuouslyReasoningPredictor(nn.Module):
             )
 
             # Consolidation Trigger Logic (remains largely the same, operates on latest states)
+            # `current_confidence` and `current_meta_error` from _get_predicted_embedding are now tensors [batch_size]
+            # Here we check their mean, which is suitable for a single global decision to consolidate.
             if self.latest_confidence is not None and self.latest_meta_error is not None:
                 confidence_threshold = 0.8
                 meta_error_threshold = 0.1
                 
-                if self.latest_confidence.mean().item() > confidence_threshold and \
-                self.latest_meta_error.mean().item() < meta_error_threshold:
+                # Use the scalar `self.latest_confidence` and `self.latest_meta_error` which are already means
+                if self.latest_confidence > confidence_threshold and \
+                   self.latest_meta_error < meta_error_threshold:
                     
-                    logger.debug(f"Adding to consolidation queue: Confidence={self.latest_confidence.mean().item():.4f}, MetaError={self.latest_meta_error.mean().item():.4f}")
+                    logger.debug(f"Adding to consolidation queue: Confidence={self.latest_confidence:.4f}, MetaError={self.latest_meta_error:.4f}")
                     
                     # Add current HTM states to consolidation queue
-                    # spatial_pooler_output is now a batch of SDRs.
-                    # We might want to pass the entire batch for consolidation, or a subset.
-                    # For simplicity, if consolidation processes one trace at a time,
-                    # we might need to decide which trace from the batch to consolidate.
-                    # For now, will pass the entire batch as a list of individual SDRs from the batch
-                    # This will assume consolidation_manager can process a list of SDRs (from the batch dimension)
+                    # spatial_pooler_output is now a batch of SDRs [batch_size, sdr_size].
+                    # Pass individual SDRs from batch for consolidation.
                     self.consolidation_manager.add_to_consolidation_queue(
-                        memory_trace=[sdr for sdr in spatial_pooler_output] # Pass individual SDRs from batch
+                        memory_trace=[sdr for sdr in spatial_pooler_output.detach().cpu()] # Detach and move to CPU if consolidation manager is CPU-bound
                     )
                     
                     self.consolidation_counter += 1
                     if self.consolidation_counter % self.consolidation_interval == 0:
                         logger.info("Initiating consolidation of memories from queue.")
-                        pass 
+                        pass # Actual consolidation happens in a background thread via ConsolidationManager
                         self.consolidation_counter = 0 
             
             # Memory visualization (uses the last item from the batch for display)
             if websocket_manager and websocket_manager.active_connections:
-                predictive_cells = self.temporal_memory.predictive_cells 
-                volatile_perms = self.temporal_memory.volatile_permanences
-                consolidated_perms = self.temporal_memory.consolidated_permanences
-
-                # Select the LAST item from the batch for visualization
-                sdr_for_viz = spatial_pooler_output[-1] 
+                # Use the `active_cells_for_viz` returned by _get_predicted_embedding, which is already a single item
+                sdr_for_viz = spatial_pooler_output[-1] # The last SDR from the batch
                 sdr_list = sdr_for_viz.flatten().int().tolist()
                 
-                active_cells_list = active_cells.flatten().int().tolist()
-                predictive_cells_list = predictive_cells.flatten().int().tolist()
+                active_cells_list = active_cells_for_viz.flatten().int().tolist()
+                predictive_cells_list = self.temporal_memory.predictive_cells[-1].flatten().int().tolist() # Get last item of current predictive state
+
+                volatile_perms = self.temporal_memory.volatile_permanences
+                consolidated_perms = self.temporal_memory.consolidated_permanences
 
                 volatile_hist = torch.histogram(volatile_perms.flatten().cpu(), bins=32, range=(0.0, 1.0))
                 consolidated_hist = torch.histogram(consolidated_perms.flatten().cpu(), bins=32, range=(0.0, 1.0))
@@ -372,7 +371,7 @@ class ContinuouslyReasoningPredictor(nn.Module):
                     )
             input_embedding_sdr_batch = torch.stack(input_embedding_sdr_batch, dim=0)
 
-            predicted_embedding, _, _, _ = await self._get_predicted_embedding(input_embedding_sdr_batch)
+            predicted_embedding, spatial_pooler_output, _, _ = await self._get_predicted_embedding(input_embedding_sdr_batch)
             
             batch_size = predicted_embedding.shape[0]
             hidden = self.text_decoder.get_initial_hidden(predicted_embedding)
@@ -425,8 +424,8 @@ class ContinuouslyReasoningPredictor(nn.Module):
             generated_ids_list_batch = await self.generate_text([self_reflection_prompt], max_len=max_len)
             thought_text = decode_sequence(generated_ids_list_batch[0], vocab, self.eos_token_id) # Take the first (and only) sequence
 
-            confidence = self.latest_confidence.mean().item() if self.latest_confidence is not None else 0.0
-            meta_error = self.latest_meta_error.mean().item() if self.latest_meta_error is not None else 0.0
+            confidence = self.latest_confidence # This is already a scalar mean from _get_predicted_embedding
+            meta_error = self.latest_meta_error # This is already a scalar mean from _get_predicted_embedding
             focus = self.emotions.get_focus()
             curiosity = self.emotions.get_curiosity()
 
