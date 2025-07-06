@@ -1,8 +1,5 @@
 # SwapnaVue: A Continuously Reasoning HTM Architecture
 
-![status](status1.png)
-![status](status2.png)
-
 SwapnaVue is an advanced, experimental software architecture designed to simulate a continuously learning artificial cognitive system. It integrates principles from neuroscience and economics to create a model that learns from data streams, forms long-term memories, and dynamically regulates its own internal state over time.
 
 ## Acknowledgments

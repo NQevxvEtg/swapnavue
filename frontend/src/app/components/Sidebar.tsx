@@ -37,7 +37,7 @@ interface SidebarProps {
 
 export const Sidebar = ({ isExpanded }: SidebarProps) => {
   const navItems = [
-    { href: '/', label: 'Chat', icon: '🪞' },
+    { href: '/', label: 'Chat', icon: '🗨️' },
     { href: '/internal-dialog', label: 'Internal Dialog', icon: '🧘' },
     { href: '/status', label: 'Status', icon: '⚡' },
     { href: '/memory', label: 'Memory', icon: '🌊' },

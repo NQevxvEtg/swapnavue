@@ -10,4 +10,8 @@ psycopg2-binary
 
 # ML & Data Stack
 transformers
+sentence-transformers
 langchain-community
+
+# other
+pdfminer.six

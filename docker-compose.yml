@@ -20,9 +20,11 @@ services:
     restart: always
     env_file: ./.env
     environment:
-      PYTORCH_CUDA_ALLOC_CONF: "expandable_segments:True" 
+      TOKENIZERS_PARALLELISM: "false"
       DATABASE_URL: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}"
       DATA_DIR: ${DATA_DIR:-/app/data}
+      SENTENCE_TRANSFORMERS_HOME: /app/models/sentence_transformers_cache
+      PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
     ports:
       - "8000:8000"
     depends_on:
@@ -30,6 +32,7 @@ services:
     volumes:
       - ./src:/app/src
       - ./models:/app/models
+      - ./cache:/app/cache
       - ./data:/app/data
       - ./.env:/app/.env
     deploy:
@@ -58,3 +61,4 @@ services:
 
 volumes:
   db_data:
+  sentence_transformers_cache:

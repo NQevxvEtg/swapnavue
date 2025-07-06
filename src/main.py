@@ -89,8 +89,8 @@ async def _generate_and_store_internal_thought():
                     self_reflection_prompt = ""
                 else:
                     current_states = {
-                        "confidence": model.latest_confidence if model.latest_confidence is not None else 0.0, # FIXED: Removed .mean().item()
-                        "meta_error": model.latest_meta_error if model.latest_meta_error is not None else 0.0, # FIXED: Removed .mean().item()
+                        "confidence": model.latest_confidence if model.latest_confidence is not None else 0.0,
+                        "meta_error": model.latest_meta_error if model.latest_meta_error is not None else 0.0,
                         "focus": model.emotions.get_focus(),
                         "curiosity": model.emotions.get_curiosity()
                     }
@@ -106,8 +106,8 @@ async def _generate_and_store_internal_thought():
                 # Restore the logic to create and store the thought entry
                 thought_entry = InternalThoughtResponse(
                     thought=thought_text, timestamp=datetime.now(), 
-                    confidence=model.latest_confidence if model.latest_confidence is not None else 0.0, # FIXED: Removed .mean().item()
-                    meta_error=model.latest_meta_error if model.latest_meta_error is not None else 0.0, # FIXED: Removed .mean().item()
+                    confidence=model.latest_confidence if model.latest_confidence is not None else 0.0,
+                    meta_error=model.latest_meta_error if model.latest_meta_error is not None else 0.0,
                     focus=model.emotions.get_focus(), curiosity=model.emotions.get_curiosity(), prompt_text=self_reflection_prompt
                 )
                 app.state.internal_thoughts_queue.append(thought_entry)
@@ -254,7 +254,17 @@ async def startup_event():
     if os.path.exists(MODEL_CHECKPOINT_PATH):
         try:
             checkpoint = torch.load(MODEL_CHECKPOINT_PATH, map_location=DEVICE)
-            app.state.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            
+            # Filter out dynamic internal TM states that cause size mismatches
+            filtered_state_dict = {
+                k: v for k, v in checkpoint['model_state_dict'].items() 
+                if not (k.endswith('temporal_memory.active_cells') or
+                        k.endswith('temporal_memory.predictive_cells') or
+                        k.endswith('temporal_memory.winner_cells'))
+            }
+
+            # Load the filtered state_dict. strict=False will handle any other minor mismatches.
+            app.state.model.load_state_dict(filtered_state_dict, strict=False)
             
             if 'optimizer_state_dict' in checkpoint:
                  app.state.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -326,8 +336,9 @@ async def generate_response(request: GenerateRequest, db: Session = Depends(get_
         logger.error(f"Error in response pipeline: {e}", exc_info=True)
         response_text = f"Error: An internal exception occurred. ({e})"
     
-    confidence = model.latest_confidence if model.latest_confidence is not None else 0.0, # FIXED: Removed .mean().item()
-    meta_error = model.latest_meta_error if model.latest_meta_error is not None else 0.0, # FIXED: Removed .mean().item()
+    # FIX: Removed trailing commas to ensure values are floats, not tuples
+    confidence = model.latest_confidence if model.latest_confidence is not None else 0.0
+    meta_error = model.latest_meta_error if model.latest_meta_error is not None else 0.0
     
     # Restore database logging for chat messages
     try:
@@ -427,8 +438,8 @@ async def get_training_status():
         train_loss=training_state.train_loss,
         val_loss=training_state.val_loss if training_state.val_loss != float('inf') else None,
         best_val_loss=training_state.best_val_loss if training_state.best_val_loss != float('inf') else None,
-        confidence=model.latest_confidence if model.latest_confidence is not None else 0.0, # FIXED: Removed .mean().item()
-        meta_error=model.latest_meta_error if model.latest_meta_error is not None else 0.0, # FIXED: Removed .mean().item()
+        confidence=model.latest_confidence if model.latest_confidence is not None else 0.0,
+        meta_error=model.latest_meta_error if model.latest_meta_error is not None else 0.0,
         focus=model.emotions.get_focus(),
         curiosity=model.emotions.get_curiosity(),
         message="Training active." if training_state.is_training_active else "Training not active."

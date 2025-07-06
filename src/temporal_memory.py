@@ -19,6 +19,7 @@ class TemporalMemory(nn.Module):
                  input_dims,
                  columns,
                  cells_per_column,
+                 SCALE = 255, # Retain SCALE
                  distal_segments_per_cell=32,
                  synapses_per_segment=128,
                  permanence_threshold=0.5,
@@ -41,6 +42,7 @@ class TemporalMemory(nn.Module):
         self.consolidated_learning_rate = consolidated_learning_rate
         self.activation_threshold = activation_threshold
         self.device = device # Store the device passed to the constructor
+        self.SCALE = SCALE # Store SCALE as an instance variable
 
         # Parameters for internal states - dynamically sized in forward.
         # Initialize with batch_size 1. Will be re-instantiated if batch_size changes.
@@ -57,15 +59,29 @@ class TemporalMemory(nn.Module):
                           device=self.device),
             requires_grad=False)
         
+        # Revert back to uint8 for memory saving, initialize with scaled integer value
         self.volatile_permanences = nn.Parameter(
-            torch.rand_like(self.distal_connections, dtype=torch.float, device=self.device) * 0.1, requires_grad=False)
+            torch.full(self.distal_connections.shape, int(0.1 * self.SCALE),
+                    dtype=torch.uint8, device=self.device),
+            requires_grad=False)
+
+        # Revert back to uint8 for memory saving
         self.consolidated_permanences = nn.Parameter(
-            torch.zeros_like(self.distal_connections, dtype=torch.float, device=self.device), requires_grad=False)
-        
+            torch.zeros_like(self.distal_connections, dtype=torch.uint8, device=self.device),
+            requires_grad=False)
+
+
         # Add this lock to coordinate the main thread and consolidation thread
         self.lock = threading.Lock()
 
         logger.info("TemporalMemory: Fully initialized.") # Changed print to logger.info
+
+    # Helper functions to convert between scaled uint8 and float
+    def _to_float(self, u8_tensor: torch.Tensor) -> torch.Tensor:
+        return u8_tensor.float().div(self.SCALE)
+
+    def _to_uint8(self, float_tensor: torch.Tensor) -> torch.Tensor:
+        return (float_tensor.clamp(0.0, 1.0) * self.SCALE).round().to(torch.uint8)
 
     def forward(self, 
                 sdr_batch: torch.Tensor, # Changed from x to sdr_batch. Expected shape: [batch_size, num_columns]
@@ -150,7 +166,7 @@ class TemporalMemory(nn.Module):
                     new_active_cells[batch_item_idx, col_cells_indices] = winner_cells_mask_for_column
             
             # Set global winner_cells based on the batch's active columns for learning
-            self.winner_cells.data.copy_(new_active_cells) # FIXED: Use .data.copy_()
+            self.winner_cells.data.copy_(new_active_cells) # Use .data.copy_()
             
             # Step 2: Learn based on the current activations and previous active cells
             # This adjusts permanences for segments on the 'winner_cells' based on 'prev_active_cells'.
@@ -172,8 +188,8 @@ class TemporalMemory(nn.Module):
                     new_predictive_cells_for_next_step[batch_item_idx, col_cells_indices] = predictive_mask
 
             # Update the internal state of the TM after processing all columns in the batch
-            self.active_cells.data.copy_(new_active_cells) # FIXED: Use .data.copy_()
-            self.predictive_cells.data.copy_(new_predictive_cells_for_next_step) # FIXED: Use .data.copy_()
+            self.active_cells.data.copy_(new_active_cells) # Use .data.copy_()
+            self.predictive_cells.data.copy_(new_predictive_cells_for_next_step) # Use .data.copy_()
             
             # Calculate and return current batch accuracy (proportion of predicted columns)
             current_batch_accuracy = torch.where(
@@ -266,12 +282,14 @@ class TemporalMemory(nn.Module):
         # Get relevant distal connections and permanences for cells in this column
         # shape: (cells_per_column, distal_segments_per_cell, synapses_per_segment)
         col_distal_connections = self.distal_connections[col_cells_indices]
-        col_volatile_perms = self.volatile_permanences[col_cells_indices]
-        col_consolidated_perms = self.consolidated_permanences[col_cells_indices]
+        
+        # Convert uint8 permanences to float for comparison
+        col_volatile_perms_float = self._to_float(self.volatile_permanences[col_cells_indices])
+        col_consolidated_perms_float = self._to_float(self.consolidated_permanences[col_cells_indices])
 
         # Connected synapses: those above permanence_threshold
-        volatile_connected = col_volatile_perms > self.permanence_threshold
-        consolidated_connected = col_consolidated_perms > self.permanence_threshold
+        volatile_connected = col_volatile_perms_float > self.permanence_threshold
+        consolidated_connected = col_consolidated_perms_float > self.permanence_threshold # Corrected variable name
         combined_connected = volatile_connected | consolidated_connected
 
         # Presynaptic activity: which *input_active_cells_single_item* were active for these synapses
@@ -299,9 +317,6 @@ class TemporalMemory(nn.Module):
             prev_active_cells (torch.Tensor): Batch of active cells from the previous time step. Shape: [batch_size, num_cells].
             modulation_signal_batch (torch.Tensor): Batch of modulation signals. Shape: [batch_size].
         """
-        # This function still contains sequential processing per batch item.
-        # Vectorizing this is the next significant step after the main forward pass.
-        
         batch_size = prev_active_cells.shape[0]
 
         for batch_item_idx in range(batch_size):
@@ -344,40 +359,35 @@ class TemporalMemory(nn.Module):
             presynaptic_was_active_mask_flat = prev_active_cells[batch_item_idx][synapses_to_update_global_indices]
 
             potentiation = self.volatile_learning_rate * modulation_signal_batch[batch_item_idx].item()
-            punishment = potentiation * 0.1 # N.B.: original was 0.1, making it dynamic now
+            punishment = potentiation * 0.1 
 
-            # --- Apply updates to volatile_permanences ---
-            # These updates are currently still modifying the SHARED self.volatile_permanences
-            # If each batch item should have its own set of permanences, this structure needs deeper thought.
-            # Assuming shared permanences that are updated by the collective batch.
+            # --- Explicit conversion for arithmetic and back for storage ---
+            current_volatile_perms_slice_u8 = self.volatile_permanences[
+                selected_cell_indices_tensor, selected_segment_indices_tensor, synapse_indices
+            ]
+            
+            current_volatile_perms_float = self._to_float(current_volatile_perms_slice_u8)
+
+            current_volatile_perms_float[presynaptic_was_active_mask_flat] += potentiation
+            current_volatile_perms_float[~presynaptic_was_active_mask_flat] -= punishment
+            
+            # Convert back to uint8 and assign
             self.volatile_permanences[
                 selected_cell_indices_tensor, selected_segment_indices_tensor, synapse_indices
-            ][presynaptic_was_active_mask_flat] += potentiation
-            
-            self.volatile_permanences[
-                selected_cell_indices_tensor, selected_segment_indices_tensor, synapse_indices
-            ][~presynaptic_was_active_mask_flat] -= punishment
-            
-            # Clamp permanences to [0, 1] range
-            self.volatile_permanences.clamp_(0, 1) # Use in-place clamp for efficiency
+            ] = self._to_uint8(current_volatile_perms_float)
 
 
     def consolidate(self, memory_trace: list[torch.Tensor]):
         """
         Consolidates a memory trace (sequence of SDRs) into long-term memory.
         """
-        # This function still processes traces sequentially.
-        # Batching consolidation would require memory_trace to be structured as a batch of traces.
         with self.lock:
             logger.info(f"Consolidating a memory trace of length {len(memory_trace)}...") 
             
-            # Initialize temporary states for consolidation process
-            # These will act as batch_size=1 internal states for the sequential consolidation loop
             temp_active_cells_for_consolidation = torch.zeros(1, self.num_cells, dtype=torch.bool, device=self.device)
             temp_predictive_cells_for_consolidation = torch.zeros(1, self.num_cells, dtype=torch.bool, device=self.device)
 
-            for sdr in memory_trace: # sdr is typically [num_columns]
-                # Ensure sdr is [1, num_columns] for consistent processing
+            for sdr in memory_trace: 
                 sdr_single_item = sdr.unsqueeze(0) if sdr.dim() == 1 else sdr
 
                 current_active_cells_for_consolidation_single = torch.zeros(1, self.num_cells, dtype=torch.bool, device=self.device)
@@ -388,7 +398,6 @@ class TemporalMemory(nn.Module):
                 for col_idx in active_column_indices_in_sdr:
                     col_cells_indices = self.get_column_cell_indices(col_idx.item())
                     
-                    # _compute_predictive_state expects a single item prev_active_cells
                     predictive_mask = self._compute_predictive_state(col_idx.item(), temp_active_cells_for_consolidation.squeeze(0))
 
                     if torch.any(predictive_mask):
@@ -398,24 +407,15 @@ class TemporalMemory(nn.Module):
                         current_active_cells_for_consolidation_single[0, col_cells_indices] = True
                         current_winner_cells_for_consolidation_single[0, col_cells_indices] = torch.ones(self.cells_per_column, dtype=torch.bool, device=self.device)
 
-                # Perform consolidated learning
-                # _consolidated_learn expects single item tensors, so squeeze batch dim
                 self._consolidated_learn(temp_active_cells_for_consolidation.squeeze(0), current_winner_cells_for_consolidation_single.squeeze(0))
                 
-                # Update temporary active cells for the next step of the trace
                 temp_active_cells_for_consolidation = current_active_cells_for_consolidation_single.clone()
                 
-                # Update predictive cells for the next consolidation step
-                # This logic is complex and needs to be carefully vectorized if consolidation needs to be batched
-                # For now, it's a placeholder to show where it would happen for single items in the trace.
-                # It currently iterates over active columns for *this* SDR to compute next predictions for next SDR.
                 for col_idx in active_column_indices_in_sdr:
                     predictive_mask = self._compute_predictive_state(col_idx.item(), temp_active_cells_for_consolidation.squeeze(0))
                     col_cells_indices = self.get_column_cell_indices(col_idx.item())
                     temp_predictive_cells_for_consolidation[0, col_cells_indices] = predictive_mask
             
-            # Reset the main TM active/predictive state after consolidation
-            # This ensures the TM starts fresh for regular forward passes after a consolidation run.
             self.active_cells.zero_()
             self.predictive_cells.zero_()
             self.winner_cells.zero_()
@@ -459,19 +459,22 @@ class TemporalMemory(nn.Module):
         presynaptic_was_active_mask_flat = prev_active_cells_single_item[synapses_to_update_global_indices]
 
         potentiation = self.consolidated_learning_rate
-        punishment = potentiation * 0.25 # Can be different from volatile
+        punishment = potentiation * 0.25 
 
-        # Apply updates to consolidated_permanences (shared across batch items)
+        # --- Explicit conversion for arithmetic and back for storage ---
+        current_consolidated_perms_slice_u8 = self.consolidated_permanences[
+            selected_cell_indices_tensor, selected_segment_indices_tensor, synapse_indices
+        ]
+        
+        current_consolidated_perms_float = self._to_float(current_consolidated_perms_slice_u8)
+
+        current_consolidated_perms_float[presynaptic_was_active_mask_flat] += potentiation
+        current_consolidated_perms_float[~presynaptic_was_active_mask_flat] -= punishment
+        
+        # Convert back to uint8 and assign
         self.consolidated_permanences[
             selected_cell_indices_tensor, selected_segment_indices_tensor, synapse_indices
-        ][presynaptic_was_active_mask_flat] += potentiation
-        
-        self.consolidated_permanences[
-            selected_cell_indices_tensor, selected_segment_indices_tensor, synapse_indices
-        ][~presynaptic_was_active_mask_flat] -= punishment
-        
-        # Clamp permanences
-        self.consolidated_permanences.clamp_(0, 1) # Use in-place clamp for efficiency
+        ] = self._to_uint8(current_consolidated_perms_float)
 
 
     def get_column_cell_indices(self, col_idx: int) -> torch.Tensor:

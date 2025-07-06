@@ -311,11 +311,12 @@ class ContinuouslyReasoningPredictor(nn.Module):
                 active_cells_list = active_cells_for_viz.flatten().int().tolist()
                 predictive_cells_list = self.temporal_memory.predictive_cells[-1].flatten().int().tolist() # Get last item of current predictive state
 
-                volatile_perms = self.temporal_memory.volatile_permanences
-                consolidated_perms = self.temporal_memory.consolidated_permanences
+                # Convert permanences to float before computing histogram
+                volatile_perms_float = self.temporal_memory._to_float(self.temporal_memory.volatile_permanences)
+                consolidated_perms_float = self.temporal_memory._to_float(self.temporal_memory.consolidated_permanences)
 
-                volatile_hist = torch.histogram(volatile_perms.flatten().cpu(), bins=32, range=(0.0, 1.0))
-                consolidated_hist = torch.histogram(consolidated_perms.flatten().cpu(), bins=32, range=(0.0, 1.0))
+                volatile_hist = torch.histogram(volatile_perms_float.flatten().cpu(), bins=32, range=(0.0, 1.0))
+                consolidated_hist = torch.histogram(consolidated_perms_float.flatten().cpu(), bins=32, range=(0.0, 1.0))
                 
                 permanence_data = {
                     'volatile': {

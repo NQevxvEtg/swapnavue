@@ -24,7 +24,7 @@ logger.setLevel(logging.INFO)
 # --- Training Related Configurations ---
 DATA_DIR = os.getenv("DATA_DIR", "/app/data")
 TRAIN_EPOCHS = int(os.getenv("TRAIN_EPOCHS", "500"))
-TRAIN_BATCH_SIZE = int(os.getenv("TRAIN_BATCH_SIZE", "32"))
+TRAIN_BATCH_SIZE = int(os.getenv("TRAIN_BATCH_SIZE", "8"))
 MAX_SEQ_LEN = int(os.getenv("MAX_SEQ_LEN", "256"))
 INITIAL_LEARNING_RATE = float(os.getenv("INITIAL_LEARNING_RATE", "0.001"))
 SAVE_INTERVAL_BATCHES = int(os.getenv("SAVE_INTERVAL_BATCHES", "100"))
@@ -197,6 +197,7 @@ async def validate_model_step(
     logger.info(f"Validation complete over {num_processed_dataloader_batches} DataLoader batches. Average Validation Loss: {avg_val_loss:.4f}")
     return avg_val_loss
 
+
 async def run_model_training(
     model: ContinuouslyReasoningPredictor,
     vocab: Vocabulary,
@@ -257,7 +258,17 @@ async def run_model_training(
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             checkpoint = torch.load(model_checkpoint_path, map_location=device)
-            model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            
+            # Filter out dynamic internal TM states that cause size mismatches during training load
+            filtered_state_dict = {
+                k: v for k, v in checkpoint['model_state_dict'].items() 
+                if not (k.endswith('temporal_memory.active_cells') or
+                        k.endswith('temporal_memory.predictive_cells') or
+                        k.endswith('temporal_memory.winner_cells'))
+            }
+
+            # Load the filtered state_dict. strict=False will handle any other minor mismatches.
+            model.load_state_dict(filtered_state_dict, strict=False)
 
             if 'optimizer_state_dict' in checkpoint:
                 try:
