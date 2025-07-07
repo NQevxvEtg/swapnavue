@@ -20,7 +20,8 @@ from src.utils import initialize_weights, decode_sequence, Vocabulary
 from src.emotion import EmotionalCore
 from src.heart import Heart
 from src.self_reflection import SelfReflectionModule
-from src.self_prompting import SelfPromptingModule
+# REMOVED: No longer importing SelfPromptingModule as it's been removed entirely.
+# from src.self_prompting import SelfPromptingModule
 from src.encoders import SensorimotorEncoder
 from src.spatial_pooler import SpatialPooler
 from src.temporal_memory import TemporalMemory
@@ -98,7 +99,8 @@ class ContinuouslyReasoningPredictor(nn.Module):
 
         # --- Other Modules and Managers ---
         self.self_reflection_module = SelfReflectionModule(self.model_dims, self.model_dims).to(device)
-        self.self_prompting_module = SelfPromptingModule().to(device)
+        # REMOVED: No longer instantiating SelfPromptingModule here as it's been removed entirely from the architecture.
+        # self.self_prompting_module = SelfPromptingModule().to(device)
         self.consolidation_manager = ConsolidationManager(temporal_memory=self.temporal_memory)
 
         # --- State Variables ---
@@ -220,8 +222,7 @@ class ContinuouslyReasoningPredictor(nn.Module):
         self.latest_heart_metrics = self.heart.beat(self.emotions, current_confidence, current_meta_error) # Pass batched confidence/meta_error to heart if it handles it, or average here. Current Heart expects scalars.
         # Adjusted: Heart.beat expects scalar confidence/meta_error, so pass the means.
         # If Heart.beat expects full tensors for internal logic (e.g., batch-wise stress), it needs refactoring.
-        # Based on heart.py, it uses .mean().item(), so passing raw current_confidence, current_meta_error is fine if they are [batch_size] tensors.
-        # Let's check heart.py again: it calls `latest_confidence.mean().item()`. So passing `current_confidence` (tensor) is correct.
+        # Based on heart.py, it uses .mean().item(), so passing `current_confidence` (tensor) is correct.
 
         predicted_embedding = self.project_head(reasoned_state_z0) + htm_predicted_embedding
 
@@ -408,20 +409,24 @@ class ContinuouslyReasoningPredictor(nn.Module):
 
 
     async def generate_internal_thought(self, vocab, max_len: int = 64, input_prompt_override: str = None) -> tuple[str, float, float, int, float, str]:
+        # This function is no longer called from main.py, as self_prompting_module is removed.
+        # Keeping it for reference or if re-integrated in another way.
         self.eval()
         with torch.no_grad():
             if input_prompt_override is not None:
                 self_reflection_prompt = input_prompt_override
             else:
+                # This part would now be unreachable as self_prompting_module is removed
                 current_states = {
                     "confidence": self.latest_confidence.mean().item() if self.latest_confidence is not None else 0.0,
                     "meta_error": self.latest_meta_error.mean().item() if self.latest_meta_error is not None else 0.0,
                     "focus": self.emotions.get_focus(),
                     "curiosity": self.emotions.get_curiosity()
                 }
-                self_reflection_prompt = self.self_prompting_module.generate_prompt(current_states)
+                # This line would cause an error:
+                # self_reflection_prompt = self.self_prompting_module.generate_prompt(current_states) 
+                self_reflection_prompt = "" # Placeholder if function was called
 
-            # Now, generate_text expects a list of strings
             generated_ids_list_batch = await self.generate_text([self_reflection_prompt], max_len=max_len)
             thought_text = decode_sequence(generated_ids_list_batch[0], vocab, self.eos_token_id) # Take the first (and only) sequence
 

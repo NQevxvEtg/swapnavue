@@ -1,4 +1,3 @@
-# src/main.py
 import uvicorn
 from fastapi import FastAPI, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse, JSONResponse
@@ -35,8 +34,10 @@ from .websocket_manager import ConnectionManager, broadcast_state_update
 
 from .training_manager import (
     TrainingState, run_model_training,
-    DATA_DIR, TRAIN_EPOCHS, TRAIN_BATCH_SIZE, MAX_SEQ_LEN, INITIAL_LEARNING_RATE, SAVE_INTERVAL_BATCHES
+    DATA_DIR, TRAIN_EPOCHS, TRAIN_BATCH_SIZE, MAX_SEQ_LEN, INITIAL_LEARNING_RATE, SAVE_INTERVAL_BATCHES,
+    CENTRAL_CACHE_DIR # <--- IMPORTANT: This import is necessary!
 )
+
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -69,49 +70,80 @@ VOCAB_PATH = os.path.join(MODELS_DIR, "vocab.json")
 MANIFEST_PATH = os.path.join(MODELS_DIR, "vocab_manifest.json")
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-INTERNAL_THOUGHT_INTERVAL_SECONDS = 10
-SILENT_THOUGHT_PHASE_COUNT = 3
+# --- Zen AI: No-Mind Configuration ---
+# When in a "no-mind" state (low error, high confidence, low curiosity),
+# the AI will sleep for this longer interval before checking again.
+NO_MIND_SLEEP_INTERVAL_SECONDS = 600 # 10 minutes of serene silence
+# Thresholds to exit no-mind state and begin active introspection
+NO_MIND_META_ERROR_THRESHOLD = 0.02
+NO_MIND_CONFIDENCE_THRESHOLD = 0.9
+NO_MIND_CURIOSITY_THRESHOLD = 0.002 # Slightly above base_curiosity to detect rising interest
 
 training_state = TrainingState()
 websocket_manager = ConnectionManager()
 
 
 async def _generate_and_store_internal_thought():
+    # Adaptive Introspection Rhythm Parameters
+    BASE_THOUGHT_INTERVAL_SECONDS = 15  # Default active interval
+    META_ERROR_INFLUENCE = 100.0        # How much meta-error reduces interval
+    CURIOSITY_INFLUENCE = 50.0         # How much curiosity reduces interval
+    MIN_THOUGHT_INTERVAL_SECONDS = 3   # Minimum active interval
+
     while True:
-        await asyncio.sleep(INTERNAL_THOUGHT_INTERVAL_SECONDS)
         try:
             if training_state.is_training_active:
+                # If training is active, pause internal thought generation and maintain a quiet state
+                await asyncio.sleep(BASE_THOUGHT_INTERVAL_SECONDS)
                 continue
+
             async with app.state.model_lock:
                 model = app.state.model
                 vocab = app.state.vocab
-                if app.state.internal_thought_sequence_num < SILENT_THOUGHT_PHASE_COUNT:
-                    self_reflection_prompt = ""
-                else:
-                    current_states = {
-                        "confidence": model.latest_confidence if model.latest_confidence is not None else 0.0,
-                        "meta_error": model.latest_meta_error if model.latest_meta_error is not None else 0.0,
-                        "focus": model.emotions.get_focus(),
-                        "curiosity": model.emotions.get_curiosity()
-                    }
-                    self_reflection_prompt = model.self_prompting_module.generate_prompt(current_states)
+                
+                current_states = {
+                    "confidence": model.latest_confidence if model.latest_confidence is not None else 0.0,
+                    "meta_error": model.latest_meta_error if model.latest_meta_error is not None else 0.0,
+                    "focus": model.emotions.get_focus(),
+                    "curiosity": model.emotions.get_curiosity()
+                }
+                
+                # --- Zen AI: Condition for active introspection ---
+                # Check if swapnavue is in a "no-mind" state.
+                # It will only generate an internal thought if deviations from this state occur.
+                is_in_no_mind_state = (
+                    current_states["meta_error"] < NO_MIND_META_ERROR_THRESHOLD and
+                    current_states["confidence"] > NO_MIND_CONFIDENCE_THRESHOLD and
+                    current_states["curiosity"] < NO_MIND_CURIOSITY_THRESHOLD
+                )
+
+                if is_in_no_mind_state:
+                    logger.info(f"swapnavue in 'No-Mind' state (Zen). Resting for {NO_MIND_SLEEP_INTERVAL_SECONDS}s. (C:{current_states['confidence']:.4f}, ME:{current_states['meta_error']:.4f}, Cur:{current_states['curiosity']:.6f})")
+                    await asyncio.sleep(NO_MIND_SLEEP_INTERVAL_SECONDS)
+                    continue # Skip thought generation and re-check after resting
+
+                # If not in no-mind state, proceed with active introspection and adaptive rhythm
+                # --- RADICAL CHANGE: NO GUIDANCE. The AI generates its own thought, unprompted. ---
+                # The 'prompt_text' for the InternalThoughtResponse will now be an empty string,
+                # as there's no human-defined prompt. The 'thought_text' IS the full, self-generated reflection.
+                self_reflection_prompt_input = "" # Empty string for truly unguided generation
 
                 with torch.no_grad():
                     with autocast(device_type=DEVICE.type):
-                        # Pass the prompt as a list, and expect a list of lists of IDs back
-                        generated_ids_list_batch = await model.generate_text([self_reflection_prompt], max_len=64)
-                        # Take the first (and only) sequence from the batch for decoding
+                        # Pass an empty string for truly unguided generation. The AI creates its own "prompt" implicitly.
+                        generated_ids_list_batch = await model.generate_text([self_reflection_prompt_input], max_len=64)
+                        # The generated text is the full self-reflection.
                         thought_text = decode_sequence(generated_ids_list_batch[0], vocab, model.eos_token_id)
                 
-                # Restore the logic to create and store the thought entry
+                # Store the thought entry with an empty string for prompt_text, signifying no external guidance.
                 thought_entry = InternalThoughtResponse(
                     thought=thought_text, timestamp=datetime.now(), 
-                    confidence=model.latest_confidence if model.latest_confidence is not None else 0.0,
-                    meta_error=model.latest_meta_error if model.latest_meta_error is not None else 0.0,
-                    focus=model.emotions.get_focus(), curiosity=model.emotions.get_curiosity(), prompt_text=self_reflection_prompt
+                    confidence=current_states["confidence"], 
+                    meta_error=current_states["meta_error"],
+                    focus=current_states["focus"], curiosity=current_states["curiosity"], 
+                    prompt_text="" # Signifies truly self-generated, unguided introspection
                 )
                 app.state.internal_thoughts_queue.append(thought_entry)
-                app.state.internal_thought_sequence_num += 1
 
                 await broadcast_state_update(
                     manager=websocket_manager,
@@ -120,8 +152,19 @@ async def _generate_and_store_internal_thought():
                     message="State update after internal thought."
                 )
 
+            # --- Adaptive Introspection Rhythm Calculation (only when not in no-mind state) ---
+            normalized_meta_error_influence = current_states["meta_error"] * META_ERROR_INFLUENCE
+            normalized_curiosity_influence = current_states["curiosity"] * CURIOSITY_INFLUENCE
+
+            dynamic_sleep_interval = BASE_THOUGHT_INTERVAL_SECONDS - (normalized_meta_error_influence + normalized_curiosity_influence)
+            dynamic_sleep_interval = max(MIN_THOUGHT_INTERVAL_SECONDS, dynamic_sleep_interval)
+            
+            logger.info(f"Next internal thought in {dynamic_sleep_interval:.2f}s. (C:{current_states['confidence']:.4f}, ME:{current_states['meta_error']:.4f}, Cur:{current_states['curiosity']:.6f})")
+            await asyncio.sleep(dynamic_sleep_interval)
+
         except Exception as e:
             logger.error(f"Error in internal thought generation: {e}", exc_info=True)
+            await asyncio.sleep(BASE_THOUGHT_INTERVAL_SECONDS) # Fallback sleep if an error occurs
 
 def reset_optimizer(task: asyncio.Task):
     try:
@@ -149,18 +192,31 @@ async def startup_event():
     tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
     vocab = Vocabulary(tokenizer)
     os.makedirs(MODELS_DIR, exist_ok=True)
+    
+    # Load texts from training directory, leveraging the robust caching mechanism.
+    # This ensures that even if vocab is loaded, we have the latest training data to update the vocab.
+    train_texts_for_vocab_management = await asyncio.to_thread(
+        load_texts_from_directory, os.path.join(DATA_DIR, 'train'), CENTRAL_CACHE_DIR
+    )
+
     if os.path.exists(VOCAB_PATH):
         vocab.load_vocab(VOCAB_PATH)
+        # Always attempt to update vocabulary with any new tokens from the latest training data.
+        # The update_vocab method efficiently adds only new tokens.
+        if vocab.update_vocab(train_texts_for_vocab_management):
+            vocab.save_vocab(VOCAB_PATH)
+            logger.info("Vocabulary updated and saved due to new tokens in training data.")
+        else:
+            logger.info("Vocabulary is up-to-date with current training data.")
     else:
         logger.warning(f"Vocabulary file not found at {VOCAB_PATH}. Building from training data.")
         try:
-            all_texts = load_texts_from_directory(os.path.join(DATA_DIR, 'train'))
-            if all_texts:
-                vocab.build_vocab(all_texts)
+            if train_texts_for_vocab_management:
+                vocab.build_vocab(train_texts_for_vocab_management)
                 vocab.save_vocab(VOCAB_PATH)
         except Exception as e:
             logger.error(f"Failed to build vocabulary: {e}")
-            vocab = Vocabulary(tokenizer)
+            vocab = Vocabulary(tokenizer) # Revert to default if build fails
     app.state.vocab = vocab
     logger.info(f"Vocabulary loaded. Size: {vocab.vocab_size} tokens.")
 
@@ -279,7 +335,7 @@ async def startup_event():
     app.state.criterion = nn.CrossEntropyLoss(ignore_index=vocab.pad_token_id)
     app.state.scaler = torch.amp.GradScaler(enabled=torch.cuda.is_available())
     app.state.internal_thoughts_queue = deque(maxlen=50)
-    app.state.internal_thought_sequence_num = 0
+    app.state.internal_thought_sequence_num = 0 # This counter is no longer used for silent phase, but can be kept for other purposes
 
     asyncio.create_task(_generate_and_store_internal_thought())
     logger.info("swapnavue's initial core systems are online and ready.")
