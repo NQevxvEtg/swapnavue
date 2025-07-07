@@ -23,7 +23,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .api_models import GenerateRequest, GenerateResponse, InternalThoughtResponse, TrainingStatusResponse
 from .data_processing import (
     TextDataset, collate_fn, load_texts_from_directory,
-    create_file_manifest, get_changed_files, load_texts_from_specific_files
+    create_file_manifest, get_changed_files, # Removed load_texts_from_specific_files
 )
 from torch.utils.data import DataLoader
 
@@ -35,7 +35,7 @@ from .websocket_manager import ConnectionManager, broadcast_state_update
 from .training_manager import (
     TrainingState, run_model_training,
     DATA_DIR, TRAIN_EPOCHS, TRAIN_BATCH_SIZE, MAX_SEQ_LEN, INITIAL_LEARNING_RATE, SAVE_INTERVAL_BATCHES,
-    CENTRAL_CACHE_DIR # <--- IMPORTANT: This import is necessary!
+    CENTRAL_CACHE_DIR
 )
 
 
@@ -43,7 +43,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
-    title="swapnavue - The Living Dynamo",
+    title="swapnavue - the living dynamo",
     description="A continuously learning and self-cultivating AI agent.",
     version="0.1.0",
 )

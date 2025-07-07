@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 # --- Cache Configuration - Centralized Management ---
 # Constants for filenames within the unique dataset cache directory
-TEXT_CACHE_FILE = "texts.json"
+TEXT_CACHE_FILE = "texts_map.json" # Changed to reflect it's a map
 MANIFEST_CACHE_FILE = "manifest.json"
 
 def _get_unique_dataset_cache_paths(data_directory: str, base_cache_dir: str) -> tuple[str, str, str]:
@@ -40,85 +40,88 @@ def _get_unique_dataset_cache_paths(data_directory: str, base_cache_dir: str) ->
     manifest_cache_path = os.path.join(unique_dataset_cache_dir, MANIFEST_CACHE_FILE)
     return unique_dataset_cache_dir, text_cache_path, manifest_cache_path
 
-def _save_data_to_cache(data_directory: str, base_cache_dir: str, texts: list[str], current_manifest: dict):
-    """Saves loaded texts and the corresponding manifest to cache."""
+# Modified to save a dictionary (filepath -> lines)
+def _save_data_to_cache(data_directory: str, base_cache_dir: str, texts_map: dict[str, list[str]], current_manifest: dict):
+    """Saves loaded texts_map (filepath -> lines) and the corresponding manifest to cache."""
     unique_dataset_cache_dir, text_cache_path, manifest_cache_path = _get_unique_dataset_cache_paths(data_directory, base_cache_dir)
     os.makedirs(unique_dataset_cache_dir, exist_ok=True)
     
     try:
         with open(text_cache_path, 'w', encoding='utf-8') as f:
-            json.dump(texts, f, ensure_ascii=False, indent=2)
+            json.dump(texts_map, f, ensure_ascii=False, indent=2)
         with open(manifest_cache_path, 'w', encoding='utf-8') as f:
             json.dump(current_manifest, f, ensure_ascii=False, indent=2)
-        logger.info(f"Data and manifest saved to cache in {unique_dataset_cache_dir}")
+        logger.debug(f"Data map and manifest saved to cache in {unique_dataset_cache_dir}") # Changed to debug for less verbosity
     except Exception as e:
         logger.error(f"Failed to save data to cache {unique_dataset_cache_dir}: {e}")
 
-def _load_data_from_cache(data_directory: str, base_cache_dir: str) -> list[str] | None:
-    """Loads texts from cache."""
+# Modified to load a dictionary (filepath -> lines)
+def _load_data_from_cache(data_directory: str, base_cache_dir: str) -> dict[str, list[str]] | None:
+    """Loads texts_map (filepath -> lines) from cache."""
     _, text_cache_path, _ = _get_unique_dataset_cache_paths(data_directory, base_cache_dir)
     try:
         with open(text_cache_path, 'r', encoding='utf-8') as f:
-            texts = json.load(f)
-        logger.info(f"Loaded data from cache: {text_cache_path}")
-        return texts
+            texts_map = json.load(f)
+        logger.info(f"Loaded data map from cache: {text_cache_path}")
+        return texts_map
     except Exception as e:
-        logger.error(f"Failed to load data from cache {text_cache_path}: {e}")
+        logger.debug(f"Failed to load data map from cache {text_cache_path}: {e}. This is normal if cache is new/invalid.")
         return None
 
-def _is_cache_valid(data_directory: str, base_cache_dir: str, current_manifest: dict) -> bool:
-    """Checks if the cached data is valid based on the manifest."""
+def _load_manifest_from_cache(data_directory: str, base_cache_dir: str) -> dict | None:
+    """Loads manifest from cache."""
     _, _, manifest_cache_path = _get_unique_dataset_cache_paths(data_directory, base_cache_dir)
-    
-    if not os.path.exists(manifest_cache_path):
-        logger.debug(f"Cache manifest not found at {manifest_cache_path}. Cache invalid.")
-        return False
-    
     try:
-        with open(manifest_cache_path, 'r', encoding='utf-8') as f:
-            cached_manifest = json.load(f)
-        
-        # Compare manifests. If any file's mtime or size differs, or files are added/removed, cache is invalid.
-        if cached_manifest == current_manifest:
-            logger.debug(f"Cache manifest matches current manifest for {data_directory}. Cache is valid.")
-            return True
-        else:
-            logger.info(f"Manifest mismatch for {data_directory}. Cache invalid.")
-            return False
-            
+        if os.path.exists(manifest_cache_path):
+            with open(manifest_cache_path, 'r', encoding='utf-8') as f:
+                manifest = json.load(f)
+            logger.debug(f"Loaded manifest from cache: {manifest_cache_path}")
+            return manifest
+        return None
     except Exception as e:
-        logger.error(f"Error validating cache manifest for {data_directory}: {e}")
-        return False
+        logger.debug(f"Failed to load manifest from cache {manifest_cache_path}: {e}. This is normal if cache is new/invalid.")
+        return None
 
+def _is_file_metadata_changed(current_stats: dict, cached_stats: dict) -> bool:
+    """Checks if a single file's metadata (mtime, size, content_hash) has changed."""
+    return (current_stats['mtime'] != cached_stats['mtime'] or
+            current_stats['size'] != cached_stats['size'] or
+            current_stats.get('content_hash') != cached_stats.get('content_hash'))
 
 def create_file_manifest(directory: str) -> dict[str, dict]:
     """
     Creates a manifest of data files in a directory, recording their
-    last modification time and size for change detection.
+    last modification time, size, AND content hash for robust change detection.
     """
     manifest = {}
-    # Include .pdf in the file patterns
     file_patterns = ['*.txt', '*.tokens', '*.md', '*.csv', '*.pdf']
     
     for pattern in file_patterns:
         for filepath in glob.glob(os.path.join(directory, pattern)):
             try:
                 stats = os.stat(filepath)
-                # Use a normalized path for consistency across OS
                 normalized_path = os.path.normpath(filepath)
+                
+                # Calculate content hash
+                file_hash = hashlib.sha256()
+                with open(filepath, 'rb') as f:
+                    # Read in chunks to handle large files efficiently
+                    while chunk := f.read(8192):
+                        file_hash.update(chunk)
+                
                 manifest[normalized_path] = {
                     "mtime": stats.st_mtime,
-                    "size": stats.st_size
+                    "size": stats.st_size,
+                    "content_hash": file_hash.hexdigest() # Store the hash
                 }
             except FileNotFoundError:
-                # File might be deleted during scan, just skip it
                 continue
     return manifest
 
-def get_changed_files(directory: str, old_manifest: dict[str, dict]) -> list[str]:
+def get_changed_files(directory: str, old_manifest: dict[str, dict]) -> tuple[list[str], dict[str, dict]]:
     """
     Compares the current state of a directory to an old manifest and returns
-    a list of new or modified file paths.
+    a list of new or modified file paths, and the new full manifest.
     """
     changed_files = []
     current_manifest = create_file_manifest(directory)
@@ -130,11 +133,10 @@ def get_changed_files(directory: str, old_manifest: dict[str, dict]) -> list[str
         else:
             # File exists, check for modification
             old_stats = old_manifest[filepath]
-            if current_stats['mtime'] != old_stats['mtime'] or current_stats['size'] != old_stats['size']:
+            if _is_file_metadata_changed(current_stats, old_stats):
                 changed_files.append(filepath)
                 
-    # Also returns the generated current_manifest to avoid doing the work twice
-    return changed_files, current_manifest
+    return changed_files, current_manifest # Also return current_manifest
 
 def clean_text(text: str) -> str:
     """
@@ -190,81 +192,102 @@ def load_texts_from_pdf(filepath: str) -> list[str]:
         logger.error(f"Error loading PDF {filepath}: {e}")
     return all_pdf_texts
 
-def _process_single_file(file_path: str) -> list[str]:
+def _process_single_file_for_cache(file_path: str) -> list[str]:
     """Helper function to load texts from a single file (PDF or text)."""
     try:
+        logger.debug(f"Caching file: {os.path.basename(file_path)}")
         if file_path.lower().endswith('.pdf'):
             lines = load_texts_from_pdf(file_path)
         else:
             with open(file_path, 'r', encoding='utf-8') as f:
                 lines = [line.strip() for line in f if line.strip()] 
-        logger.info(f"Loaded {len(lines)} non-empty lines from file: {os.path.basename(file_path)}")
+        logger.debug(f"Finished processing {len(lines)} non-empty lines from: {os.path.basename(file_path)}") # Updated message
         return lines
     except Exception as e:
-        logger.error(f"Error loading {file_path}: {e}")
+        logger.error(f"Error processing file {file_path}: {e}")
         return []
-
-def load_texts_from_specific_files(filepaths: list[str]) -> list[str]:
-    """
-    Loads all lines from a specific list of text files in parallel.
-    """
-    all_texts = []
-    # Use ThreadPoolExecutor to process files in parallel
-    # You can adjust max_workers based on your CPU cores and I/O capabilities
-    with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
-        # Submit each file processing to the executor
-        future_to_file = {executor.submit(_process_single_file, fp): fp for fp in filepaths}
-        
-        for future in as_completed(future_to_file):
-            file_path = future_to_file[future]
-            try:
-                lines = future.result()
-                all_texts.extend(lines)
-            except Exception as e:
-                logger.error(f"Error processing file {file_path} in parallel: {e}")
-    return all_texts
-
 
 def load_texts_from_directory(directory: str, base_cache_dir: str) -> list[str]:
     """
     Loads all lines from text files (.txt, .tokens, .md, .csv, .pdf) in a given directory,
     leveraging a cache for faster re-loads if data hasn't changed.
-    The cache is managed within a central base_cache_dir.
+    This version supports true incremental loading and resuming by updating per-file.
     """
     logger.info(f"Attempting to load texts from directory: {directory} with cache from {base_cache_dir}.")
     
-    # 1. Generate current manifest for the directory
-    current_manifest = create_file_manifest(directory)
+    # 1. Load existing cache data (as a map) and manifest, if any
+    cached_texts_map = _load_data_from_cache(directory, base_cache_dir)
+    if cached_texts_map is None:
+        cached_texts_map = {} # Initialize empty if no cache exists
 
-    # 2. Check if cache is valid
-    if _is_cache_valid(directory, base_cache_dir, current_manifest):
-        cached_texts = _load_data_from_cache(directory, base_cache_dir)
-        if cached_texts is not None:
-            logger.info(f"Successfully loaded {len(cached_texts)} texts from cache for {directory}.")
-            return cached_texts
-        else:
-            logger.warning(f"Cache for {directory} was deemed valid but failed to load. Re-reading from disk.")
-            # Fall through to re-read from disk if loading from valid cache fails
-
-    logger.info(f"Cache for {directory} is invalid or non-existent. Re-reading all data from disk.")
+    cached_manifest = _load_manifest_from_cache(directory, base_cache_dir)
+    if cached_manifest is None:
+        cached_manifest = {} # Initialize empty if no manifest exists
     
-    # 3. If cache is invalid or non-existent, read all files from disk
-    all_text_files = []
-    file_patterns = ['*.txt', '*.tokens', '*.md', '*.csv', '*.pdf']
-    for pattern in file_patterns:
-        all_text_files.extend(glob.glob(os.path.join(directory, pattern)))
+    # 2. Get the current state of files on disk
+    # This also returns the full current manifest of files on disk
+    files_to_process, disk_manifest = get_changed_files(directory, cached_manifest)
 
-    if not all_text_files:
-        logger.warning(f"No text files matching patterns {file_patterns} found in {directory}. Returning empty list.")
-        return []
+    # 3. Identify files that were in cache but are no longer on disk (deleted files)
+    deleted_files = [fp for fp in cached_manifest if fp not in disk_manifest]
 
-    # Use the parallel file loading function
-    loaded_texts = load_texts_from_specific_files(all_text_files)
+    # --- Process deleted files ---
+    if deleted_files:
+        logger.info(f"Removing {len(deleted_files)} deleted files from cache for {directory}.")
+        for fp in deleted_files:
+            if fp in cached_texts_map:
+                del cached_texts_map[fp]
+            if fp in cached_manifest:
+                del cached_manifest[fp]
+        # Persist deletion changes
+        _save_data_to_cache(directory, base_cache_dir, cached_texts_map, cached_manifest)
+
+    # --- Process new/modified files iteratively ---
+    if files_to_process:
+        logger.info(f"Processing {len(files_to_process)} new/modified files for {directory}. Saving incrementally.")
+        # Use ThreadPoolExecutor for processing to still benefit from parallelism
+        # but save results per file as they complete.
+        with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
+            future_to_file = {executor.submit(_process_single_file_for_cache, fp): fp for fp in files_to_process}
+            
+            for future in as_completed(future_to_file):
+                file_path = future_to_file[future]
+                try:
+                    lines = future.result()
+                    logger.info(f"Caching content for file: {os.path.basename(file_path)}") # New INFO log for each file
+                    if lines: # Only cache if lines were successfully extracted
+                        cached_texts_map[file_path] = lines
+                        # Update manifest entry for this specific file with disk_manifest's data
+                        cached_manifest[file_path] = disk_manifest[file_path] 
+                        # Save after each file to ensure resume capability
+                        _save_data_to_cache(directory, base_cache_dir, cached_texts_map, cached_manifest)
+                    else:
+                        logger.warning(f"File {os.path.basename(file_path)} had no extractable text. Skipping from cache.")
+                        # If file previously had content and now doesn't, ensure it's removed
+                        if file_path in cached_texts_map:
+                            del cached_texts_map[file_path]
+                        if file_path in cached_manifest:
+                            del cached_manifest[file_path]
+                        _save_data_to_cache(directory, base_cache_dir, cached_texts_map, cached_manifest)
+
+                except Exception as e:
+                    logger.error(f"Error processing and caching file {file_path}: {e}")
+                    # Even on error for one file, we save the progress for others
+                    _save_data_to_cache(directory, base_cache_dir, cached_texts_map, cached_manifest)
+
+
+    if not files_to_process and not deleted_files:
+        logger.info(f"All files in {directory} are up-to-date with cache. Loaded {sum(len(v) for v in cached_texts_map.values())} total lines.")
+    else:
+        logger.info(f"Incremental processing complete for {directory}. Total texts after update: {sum(len(v) for v in cached_texts_map.values())} lines.")
+
+    # Convert the map of texts into a flat list for the TextDataset
+    all_final_texts = []
+    # Ensure stable order by sorting file paths
+    for filepath in sorted(cached_texts_map.keys()):
+        all_final_texts.extend(cached_texts_map[filepath])
     
-    # 4. Save newly loaded data and its manifest to cache
-    _save_data_to_cache(directory, base_cache_dir, loaded_texts, current_manifest)
-    
-    return loaded_texts
+    return all_final_texts
 
 
 # --- Dataset and Dataloader (rest of the file remains the same) ---
