@@ -67,7 +67,7 @@ app.add_middleware(
 MODELS_DIR = "./models"
 MODEL_CHECKPOINT_PATH = os.path.join(MODELS_DIR, "swapnavue_model_checkpoint.pth")
 VOCAB_PATH = os.path.join(MODELS_DIR, "vocab.json")
-MANIFEST_PATH = os.path.join(MODELS_DIR, "vocab_manifest.json")
+MANIFEST_PATH = os.path.join(MODELS_DIR, "vocab_manifest.json") # This might not be needed explicitly anymore if vocab.json stores manifest
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # --- Zen AI: No-Mind Configuration ---
@@ -195,24 +195,27 @@ async def startup_event():
     
     # Load texts from training directory, leveraging the robust caching mechanism.
     # This ensures that even if vocab is loaded, we have the latest training data to update the vocab.
+    train_data_dir = os.path.join(DATA_DIR, 'train')
     train_texts_for_vocab_management = await asyncio.to_thread(
-        load_texts_from_directory, os.path.join(DATA_DIR, 'train'), CENTRAL_CACHE_DIR
+        load_texts_from_directory, train_data_dir, CENTRAL_CACHE_DIR
     )
+    # New: Create the current manifest for vocabulary management
+    current_train_manifest_for_vocab = await asyncio.to_thread(create_file_manifest, train_data_dir)
 
     if os.path.exists(VOCAB_PATH):
         vocab.load_vocab(VOCAB_PATH)
         # Always attempt to update vocabulary with any new tokens from the latest training data.
-        # The update_vocab method efficiently adds only new tokens.
-        if vocab.update_vocab(train_texts_for_vocab_management):
+        # The update_vocab method efficiently adds only new tokens, now also intelligently checking the manifest.
+        if vocab.update_vocab(train_texts_for_vocab_management, current_train_manifest_for_vocab): # Pass manifest
             vocab.save_vocab(VOCAB_PATH)
-            logger.info("Vocabulary updated and saved due to new tokens in training data.")
+            logger.info("Vocabulary updated and saved due to new tokens in training data or manifest changes.")
         else:
-            logger.info("Vocabulary is up-to-date with current training data.")
+            logger.info("Vocabulary is up-to-date with current training data and manifest.")
     else:
         logger.warning(f"Vocabulary file not found at {VOCAB_PATH}. Building from training data.")
         try:
             if train_texts_for_vocab_management:
-                vocab.build_vocab(train_texts_for_vocab_management)
+                vocab.build_vocab(train_texts_for_vocab_management, current_train_manifest_for_vocab) # Pass manifest
                 vocab.save_vocab(VOCAB_PATH)
         except Exception as e:
             logger.error(f"Failed to build vocabulary: {e}")

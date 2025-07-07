@@ -25,6 +25,7 @@ class Vocabulary:
         """
         self.word2idx = {}
         self.idx2word = {}
+        self.manifest: dict = {} # New: Stores the file manifest used to build this vocabulary
         
         if tokenizer is None:
             self.tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
@@ -74,29 +75,38 @@ class Vocabulary:
             for token in tokens:
                 self.add_word(token)
 
-    def build_vocab(self, texts: list[str]):
+    def build_vocab(self, texts: list[str], current_manifest: dict): # Modified signature
         """
         Builds the vocabulary from a list of text strings using an efficient batch method.
+        Updates the internal manifest.
         """
         self._build_vocab_from_batch(texts)
+        self.manifest = current_manifest # Store the manifest used to build this vocab
         logger.info(f"Vocabulary built with {len(self.word2idx)} unique custom tokens.")
 
-    def update_vocab(self, texts: list[str]) -> bool:
+    def update_vocab(self, texts: list[str], current_data_manifest: dict) -> bool: # Modified signature
         """
         Updates the vocabulary with new tokens from a list of texts using an efficient batch method.
         Returns True if the vocabulary was modified, False otherwise.
+        Now intelligently checks the provided manifest to avoid unnecessary tokenization.
         """
+        if self.manifest == current_data_manifest:
+            logger.info("Vocabulary manifest matches current data manifest. No update needed.")
+            return False
+
         initial_vocab_size = self.vocab_size
         logger.info(f"Starting vocabulary update check. Initial size: {initial_vocab_size}")
+        logger.info("Manifest mismatch detected. Re-tokenizing all current data to update vocabulary.")
         
         self._build_vocab_from_batch(texts) # Use the new, faster batch method
+        self.manifest = current_data_manifest # Update the stored manifest
 
         final_vocab_size = self.vocab_size
         if final_vocab_size > initial_vocab_size:
             logger.info(f"Vocabulary updated. Added {final_vocab_size - initial_vocab_size} new tokens. Final size: {final_vocab_size}")
             return True
         else:
-            logger.info("Vocabulary is already up-to-date. No new tokens found.")
+            logger.info("Vocabulary is already up-to-date with current data. No new tokens found after re-tokenization.")
             return False
 
     def encode(self, text: str) -> list[int]:
@@ -130,17 +140,25 @@ class Vocabulary:
         return len(self.word2idx)
 
     def save_vocab(self, path: str):
-        """Saves the vocabulary (word2idx mapping) to a JSON file."""
+        """Saves the vocabulary (word2idx mapping) and its manifest to a JSON file."""
+        data_to_save = {
+            'word2idx': self.word2idx,
+            'manifest': self.manifest # New: Save the manifest
+        }
         with open(path, 'w', encoding='utf-8') as f:
-            json.dump(self.word2idx, f, ensure_ascii=False, indent=4)
-        logger.info(f"Vocabulary saved to {path}. Size: {self.vocab_size}")
+            json.dump(data_to_save, f, ensure_ascii=False, indent=4)
+        logger.info(f"Vocabulary and manifest saved to {path}. Size: {self.vocab_size}")
 
     def load_vocab(self, path: str):
         """Loads the vocabulary from a JSON file."""
         with open(path, 'r', encoding='utf-8') as f:
-            self.word2idx = json.load(f)
+            loaded_data = json.load(f)
+            self.word2idx = loaded_data['word2idx']
+            # New: Load the manifest, handle old formats without it
+            self.manifest = loaded_data.get('manifest', {}) 
             self.idx2word = {idx: word for word, idx in self.word2idx.items()}
         
+        # Ensure special tokens are correctly set or re-added if missing/lost
         self.pad_token_id = self.word2idx.get('<pad>')
         self.sos_token_id = self.word2idx.get('<sos>')
         self.eos_token_id = self.word2idx.get('<eos>')
